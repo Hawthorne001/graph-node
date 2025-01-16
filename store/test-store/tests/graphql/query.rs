@@ -1,10 +1,11 @@
 use graph::blockchain::{Block, BlockTime};
+use graph::data::query::Trace;
+use graph::data::store::scalar::Timestamp;
 use graph::data::subgraph::schema::DeploymentCreate;
 use graph::data::subgraph::LATEST_VERSION;
 use graph::entity;
 use graph::prelude::{SubscriptionResult, Value};
 use graph::schema::InputSchema;
-use graphql_parser::Pos;
 use std::iter::FromIterator;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -17,6 +18,7 @@ use test_store::block_store::{
     FakeBlock, BLOCK_FOUR, BLOCK_ONE, BLOCK_THREE, BLOCK_TWO, GENESIS_BLOCK,
 };
 
+use graph::futures03::stream::StreamExt;
 use graph::{
     components::store::DeploymentLocator,
     data::graphql::{object, object_value},
@@ -26,11 +28,10 @@ use graph::{
         subgraph::SubgraphFeature,
     },
     prelude::{
-        futures03::stream::StreamExt, lazy_static, o, q, r, serde_json, slog, BlockPtr,
-        DeploymentHash, Entity, EntityOperation, FutureExtension, GraphQlRunner as _, Logger,
-        NodeId, Query, QueryError, QueryExecutionError, QueryResult, QueryStoreManager,
-        QueryVariables, SubgraphManifest, SubgraphName, SubgraphStore,
-        SubgraphVersionSwitchingMode, Subscription, SubscriptionError,
+        lazy_static, o, q, r, serde_json, slog, BlockPtr, DeploymentHash, Entity, EntityOperation,
+        FutureExtension, GraphQlRunner as _, Logger, NodeId, Query, QueryError,
+        QueryExecutionError, QueryResult, QueryStoreManager, QueryVariables, SubgraphManifest,
+        SubgraphName, SubgraphStore, SubgraphVersionSwitchingMode, Subscription, SubscriptionError,
     },
 };
 use graph_graphql::{prelude::*, subscription::execute_subscription};
@@ -261,6 +262,7 @@ fn test_schema(id: DeploymentHash, id_type: IdType) -> InputSchema {
         bands: [Band!]!
         writtenSongs: [Song!]! @derivedFrom(field: \"writtenBy\")
         favoriteCount: Int8!
+        birthDate: Timestamp!
     }
 
     type Band @entity {
@@ -281,6 +283,7 @@ fn test_schema(id: DeploymentHash, id_type: IdType) -> InputSchema {
         reviews: [SongReview!]! @derivedFrom(field: \"song\")
         media: [Media!]!
         release: Release! @derivedFrom(field: \"songs\")
+        stats: [SongStat!]! @derivedFrom(field: \"id\")
     }
 
     type SongStat @entity {
@@ -384,21 +387,21 @@ fn test_schema(id: DeploymentHash, id_type: IdType) -> InputSchema {
 
     type Plays @entity(timeseries: true) {
         id: Int8!
-        timestamp: Int8!
+        timestamp: Timestamp!
         song: Song!
         user: User!
     }
 
     type SongPlays @aggregation(intervals: [\"hour\"], source: \"Plays\") {
         id: Int8!
-        timestamp: Int8!
+        timestamp: Timestamp!
         song: Song!
         played: Int! @aggregate(fn: \"count\")
     }
 
     type UserPlays @aggregation(intervals: [\"hour\"], source: \"Plays\") {
         id: Int8!
-        timestamp: Int8!
+        timestamp: Timestamp!
         user: User!
         played: Int! @aggregate(fn: \"count\")
     }
@@ -459,12 +462,14 @@ async fn insert_test_entities(
     let is = &manifest.schema;
     let pub1 = &*PUB1;
     let ts0 = BlockTime::for_test(&BLOCKS[0]);
+    let timestamp =
+        Timestamp::from_microseconds_since_epoch(1710837304040956).expect("valid timestamp");
     let entities0 = vec![
         (
             "Musician",
             vec![
-                entity! { is => id: "m1", name: "John", mainBand: "b1", bands: vec!["b1", "b2"], favoriteCount: 10 },
-                entity! { is => id: "m2", name: "Lisa", mainBand: "b1", bands: vec!["b1"], favoriteCount: 100 },
+                entity! { is => id: "m1", name: "John", mainBand: "b1", bands: vec!["b1", "b2"], favoriteCount: 10, birthDate: timestamp.clone() },
+                entity! { is => id: "m2", name: "Lisa", mainBand: "b1", bands: vec!["b1"], favoriteCount: 100, birthDate: timestamp.clone() },
             ],
         ),
         ("Publisher", vec![entity! { is => id: pub1 }]),
@@ -570,8 +575,8 @@ async fn insert_test_entities(
     let entities1 = vec![(
         "Musician",
         vec![
-            entity! { is => id: "m3", name: "Tom", mainBand: "b2", bands: vec!["b1", "b2"], favoriteCount: 5 },
-            entity! { is => id: "m4", name: "Valerie", bands: Vec::<String>::new(), favoriteCount: 20 },
+            entity! { is => id: "m3", name: "Tom", mainBand: "b2", bands: vec!["b1", "b2"], favoriteCount: 5, birthDate: timestamp.clone() },
+            entity! { is => id: "m4", name: "Valerie", bands: Vec::<String>::new(), favoriteCount: 20, birthDate: timestamp.clone() },
         ],
     )];
     let entities1 = insert_ops(&manifest.schema, entities1);
@@ -590,7 +595,7 @@ async fn insert_test_entities(
 }
 
 async fn execute_query(loc: &DeploymentLocator, query: &str) -> QueryResult {
-    let query = graphql_parser::parse_query(query)
+    let query = q::parse_query(query)
         .expect("invalid test query")
         .into_static();
     execute_query_document_with_variables(&loc.hash, query, None).await
@@ -708,7 +713,7 @@ where
 
             let result = {
                 let id = &deployment.hash;
-                let query = graphql_parser::parse_query(&query)
+                let query = q::parse_query(&query)
                     .expect("Invalid test query")
                     .into_static();
                 let variables = variables.clone();
@@ -750,11 +755,7 @@ async fn run_subscription(
         .await
         .unwrap();
 
-    let query = Query::new(
-        graphql_parser::parse_query(query).unwrap().into_static(),
-        None,
-        false,
-    );
+    let query = Query::new(q::parse_query(query).unwrap().into_static(), None, false);
     let options = SubscriptionExecutionOptions {
         logger: logger.clone(),
         store: query_store.clone(),
@@ -785,6 +786,7 @@ fn can_query_one_to_one_relationship() {
                 name
             }
             favoriteCount
+            birthDate
         }
         songStats(first: 100, orderBy: id) {
             id
@@ -801,10 +803,10 @@ fn can_query_one_to_one_relationship() {
         let s = id_type.songs();
         let exp = object! {
             musicians: vec![
-                object! { name: "John", mainBand: object! { name: "The Musicians" }, favoriteCount: "10" },
-                object! { name: "Lisa", mainBand: object! { name: "The Musicians" }, favoriteCount: "100" },
-                object! { name: "Tom",  mainBand: object! { name: "The Amateurs" }, favoriteCount: "5" },
-                object! { name: "Valerie", mainBand: r::Value::Null, favoriteCount: "20" }
+                object! { name: "John", mainBand: object! { name: "The Musicians" }, favoriteCount: "10", birthDate: "1710837304040956" },
+                object! { name: "Lisa", mainBand: object! { name: "The Musicians" }, favoriteCount: "100", birthDate: "1710837304040956" },
+                object! { name: "Tom",  mainBand: object! { name: "The Amateurs" }, favoriteCount: "5", birthDate: "1710837304040956" },
+                object! { name: "Valerie", mainBand: r::Value::Null, favoriteCount: "20", birthDate: "1710837304040956" }
             ],
             songStats: vec![
                 object! {
@@ -819,6 +821,44 @@ fn can_query_one_to_one_relationship() {
                 }
             ]
         };
+        let data = extract_data!(result).unwrap();
+        assert_eq!(data.to_string(), exp.to_string());
+    })
+}
+
+#[test]
+fn can_filter_by_timestamp() {
+    const QUERY1: &str = "
+    query {
+        musicians(first: 100, orderBy: id, where: { birthDate_gt: \"1710837304040955\" }) {
+            name
+        }
+    }
+    ";
+
+    const QUERY2: &str = "
+    query {
+        musicians(first: 100, orderBy: id, where: { birthDate_lt: \"1710837304040955\" }) {
+            name
+        }
+    }
+    ";
+
+    run_query(QUERY1, |result, _| {
+        let exp = object! {
+            musicians: vec![
+                object! { name: "John" },
+                object! { name: "Lisa" },
+                object! { name: "Tom" },
+                object! { name: "Valerie" }
+            ],
+        };
+        let data = extract_data!(result).unwrap();
+        assert_eq!(data, exp);
+    });
+
+    run_query(QUERY2, |result, _| {
+        let exp = object! { musicians: Vec::<r::Value>::new() };
         let data = extract_data!(result).unwrap();
         assert_eq!(data, exp);
     })
@@ -1869,7 +1909,7 @@ fn instant_timeout() {
     run_test_sequentially(|store| async move {
         let deployment = setup_readonly(store.as_ref()).await;
         let query = Query::new(
-            graphql_parser::parse_query("query { musicians(first: 100) { name } }")
+            q::parse_query("query { musicians(first: 100) { name } }")
                 .unwrap()
                 .into_static(),
             None,
@@ -2005,7 +2045,7 @@ fn ambiguous_derived_from_result() {
             )) => {
                 assert_eq!(
                     pos,
-                    &Pos {
+                    &q::Pos {
                         line: 1,
                         column: 39
                     }
@@ -2595,6 +2635,20 @@ fn can_query_meta() {
     run_query(QUERY4, |result, _| {
         assert!(result.has_errors());
     });
+
+    // metadata for number_gte 1. Returns subgraph head and a valid hash
+    const QUERY5: &str = "query { _meta(block: { number_gte: 1 }) { block { hash number } } }";
+    run_query(QUERY5, |result, _| {
+        let exp = object! {
+            _meta: object! {
+                block: object! {
+                    hash: BLOCKS[2].hash.to_string(),
+                    number: 2
+                },
+            },
+        };
+        assert_eq!(extract_data!(result), Some(exp));
+    });
 }
 
 #[test]
@@ -2946,24 +3000,59 @@ fn can_query_with_or_implicit_and_filter() {
 
 #[test]
 fn trace_works() {
+    const QUERY1: &str = "query { musicians(first: 100) { name } }";
+
+    const QUERY2: &str = r#"
+    query {
+        m0: musicians(first: 100, block: { number: 0 }) { name }
+        m1: musicians(first: 100, block: { number: 1 }) { name }
+    }"#;
+
+    async fn run_query(deployment: &DeploymentLocator, query: &str) -> QueryResults {
+        let query = Query::new(q::parse_query(query).unwrap().into_static(), None, true);
+        execute_subgraph_query(
+            query,
+            QueryTarget::Deployment(deployment.hash.clone(), Default::default()),
+        )
+        .await
+    }
+
     run_test_sequentially(|store| async move {
         let deployment = setup_readonly(store.as_ref()).await;
-        let query = Query::new(
-            graphql_parser::parse_query("query { musicians(first: 100) { name } }")
-                .unwrap()
-                .into_static(),
-            None,
-            true,
-        );
 
-        let result = execute_subgraph_query(
-            query,
-            QueryTarget::Deployment(deployment.hash, Default::default()),
-        )
-        .await;
+        let result = run_query(&deployment, QUERY1).await;
 
         let trace = &result.first().unwrap().trace;
-        assert!(!trace.is_none(), "result has a trace");
+        assert!(!trace.is_none(), "first result has a trace");
+        assert!(!result.trace.is_none(), "results has a trace");
+
+        // Check that with block constraints we get a trace for each block
+        let result = run_query(&deployment, QUERY2).await;
+        use Trace::*;
+        match &result.trace {
+            None => panic!("expected Root got None"),
+            Root { blocks, .. } => {
+                assert_eq!(2, blocks.len());
+                for twc in blocks {
+                    match twc.trace.as_ref() {
+                        Block {
+                            block, children, ..
+                        } => {
+                            assert!([0, 1].contains(block));
+                            assert_eq!(1, children.len());
+                            assert_eq!(format!("m{}", block), children[0].0);
+                            match &children[0].1 {
+                                Query { .. } => {}
+                                _ => panic!("expected Query got {:?}", children[0]),
+                            }
+                        }
+                        _ => panic!("expected Block got {:?}", twc.trace),
+                    }
+                }
+            }
+            Block { .. } => panic!("expected Root got Block"),
+            Query { .. } => panic!("expected Root got Query"),
+        }
     })
 }
 
@@ -3019,6 +3108,10 @@ fn empty_type_c() {
 
 #[test]
 fn simple_aggregation() {
+    fn ts0() -> r::Value {
+        r::Value::Timestamp(Timestamp::since_epoch(0, 0).unwrap())
+    }
+
     const SONG_QUERY: &str = "
     query {
         songPlays_collection(interval: hour) {
@@ -3039,19 +3132,19 @@ fn simple_aggregation() {
         }
     }";
 
-    const USER_QUERY2: &str = "
+    const USER_QUERY2: &str = r#"
     query {
-        userPlays_collection(interval: hour, where: { timestamp_gt: 1 }) {
+        userPlays_collection(interval: hour, where: { timestamp_gt: "1000000" }) {
             id
         }
-    }";
+    }"#;
 
     run_query(SONG_QUERY, |result, id_type| {
         let s = id_type.songs();
         let exp = object! {
             songPlays_collection: vec![
-                object! { id: "5", timestamp: "0", song: object! { id: s[1] }, played: 4 },
-                object! { id: "3", timestamp: "0", song: object! { id: s[2] }, played: 1 },
+                object! { id: "5", timestamp: ts0(), song: object! { id: s[1] }, played: 4 },
+                object! { id: "3", timestamp: ts0(), song: object! { id: s[2] }, played: 1 },
             ]
         };
         let data = extract_data!(result).unwrap();
@@ -3060,8 +3153,8 @@ fn simple_aggregation() {
     run_query(USER_QUERY1, |result, _| {
         let exp = object! {
             userPlays_collection: vec![
-                object! { id: "5", timestamp: "0", user: object! { id: "u1" }, played: 4 },
-                object! { id: "2", timestamp: "0", user: object! { id: "u2" }, played: 1 },
+                object! { id: "5", timestamp: ts0(), user: object! { id: "u1" }, played: 4 },
+                object! { id: "2", timestamp: ts0(), user: object! { id: "u2" }, played: 1 },
             ]
         };
         let data = extract_data!(result).unwrap();

@@ -17,7 +17,7 @@ use graph::prelude::{
     SubgraphStore as _, BLOCK_NUMBER_MAX,
 };
 use graph::schema::{EntityKey, EntityType, InputSchema};
-use graph::slog::{info, warn};
+use graph::slog::{debug, info, warn};
 use graph::tokio::select;
 use graph::tokio::sync::Notify;
 use graph::tokio::task::JoinHandle;
@@ -36,6 +36,7 @@ use store::StoredDynamicDataSource;
 
 use crate::deployment_store::DeploymentStore;
 use crate::primary::DeploymentId;
+use crate::relational::index::IndexList;
 use crate::retry;
 use crate::{primary, primary::Site, relational::Layout, SubgraphStore};
 
@@ -65,6 +66,10 @@ impl WritableSubgraphStore {
 
     fn find_site(&self, id: DeploymentId) -> Result<Arc<Site>, StoreError> {
         self.0.find_site(id)
+    }
+
+    fn load_indexes(&self, site: Arc<Site>) -> Result<IndexList, StoreError> {
+        self.0.load_indexes(site)
     }
 }
 
@@ -222,7 +227,8 @@ impl SyncStore {
                 Some((base_id, base_ptr)) => {
                     let src = self.store.layout(&base_id)?;
                     let deployment_entity = self.store.load_deployment(src.site.clone())?;
-                    Some((src, base_ptr, deployment_entity))
+                    let indexes = self.store.load_indexes(src.site.clone())?;
+                    Some((src, base_ptr, deployment_entity, indexes))
                 }
                 None => None,
             };
@@ -369,8 +375,9 @@ impl SyncStore {
 
     fn unassign_subgraph(&self, site: &Site) -> Result<(), StoreError> {
         retry::forever(&self.logger, "unassign_subgraph", || {
-            let pconn = self.store.primary_conn()?;
-            pconn.transaction(|| -> Result<_, StoreError> {
+            let mut pconn = self.store.primary_conn()?;
+            pconn.transaction(|conn| -> Result<_, StoreError> {
+                let mut pconn = primary::Connection::new(conn);
                 let changes = pconn.unassign_subgraph(site)?;
                 self.store.send_store_event(&StoreEvent::new(changes))
             })
@@ -413,14 +420,15 @@ impl SyncStore {
         }
     }
 
-    fn deployment_synced(&self) -> Result<(), StoreError> {
+    fn deployment_synced(&self, block_ptr: BlockPtr) -> Result<(), StoreError> {
         retry::forever(&self.logger, "deployment_synced", || {
             let event = {
                 // Make sure we drop `pconn` before we call into the deployment
                 // store so that we do not hold two database connections which
                 // might come from the same pool and could therefore deadlock
-                let pconn = self.store.primary_conn()?;
-                pconn.transaction(|| -> Result<_, Error> {
+                let mut pconn = self.store.primary_conn()?;
+                pconn.transaction(|conn| -> Result<_, Error> {
+                    let mut pconn = primary::Connection::new(conn);
                     let changes = pconn.promote_deployment(&self.site.deployment)?;
                     Ok(StoreEvent::new(changes))
                 })?
@@ -434,7 +442,7 @@ impl SyncStore {
                     if src.deployment == self.site.deployment {
                         let on_sync = self.writable.on_sync(&self.site)?;
                         if on_sync.activate() {
-                            let pconn = self.store.primary_conn()?;
+                            let mut pconn = self.store.primary_conn()?;
                             pconn.activate(&self.site.as_ref().into())?;
                         }
                         if on_sync.replace() {
@@ -444,7 +452,8 @@ impl SyncStore {
                 }
             }
 
-            self.writable.deployment_synced(&self.site.deployment)?;
+            self.writable
+                .deployment_synced(&self.site.deployment, block_ptr.clone())?;
 
             self.store.send_store_event(&event)
         })
@@ -927,6 +936,7 @@ impl Queue {
                         // Graceful shutdown. We also handled the request
                         // successfully
                         queue.queue.pop().await;
+                        debug!(logger, "Subgraph writer has processed a stop request");
                         return;
                     }
                     Ok(Err(e)) => {
@@ -1651,9 +1661,19 @@ impl WritableStoreTrait for WritableStore {
         is_caught_up_with_chain_head: bool,
     ) -> Result<(), StoreError> {
         if is_caught_up_with_chain_head {
-            self.deployment_synced()?;
+            self.deployment_synced(block_ptr_to.clone())?;
         } else {
             self.writer.start_batching();
+        }
+
+        if let Some(block_ptr) = self.block_ptr.lock().unwrap().as_ref() {
+            if block_ptr_to.number <= block_ptr.number {
+                return Err(constraint_violation!(
+                    "transact_block_operations called for block {} but its head is already at {}",
+                    block_ptr_to,
+                    block_ptr
+                ));
+            }
         }
 
         let batch = Batch::new(
@@ -1678,10 +1698,10 @@ impl WritableStoreTrait for WritableStore {
     /// - Disable the time-to-sync metrics gathering.
     /// - Stop batching writes.
     /// - Promote it to 'synced' status in the DB, if that hasn't been done already.
-    fn deployment_synced(&self) -> Result<(), StoreError> {
+    fn deployment_synced(&self, block_ptr: BlockPtr) -> Result<(), StoreError> {
         self.writer.deployment_synced();
         if !self.is_deployment_synced.load(Ordering::SeqCst) {
-            self.store.deployment_synced()?;
+            self.store.deployment_synced(block_ptr)?;
             self.is_deployment_synced.store(true, Ordering::SeqCst);
         }
         Ok(())

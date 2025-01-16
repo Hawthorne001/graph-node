@@ -16,6 +16,7 @@ use crate::schema::{ast, META_FIELD_NAME, META_FIELD_TYPE, SCHEMA_TYPE_NAME};
 use crate::data::graphql::ext::{
     camel_cased_names, DefinitionExt, DirectiveExt, DocumentExt, ValueExt,
 };
+use crate::derive::CheapClone;
 use crate::prelude::{q, r, s, DeploymentHash};
 
 use super::{Aggregation, Field, InputSchema, Schema, TypeKind};
@@ -39,7 +40,7 @@ const BLOCK_HEIGHT: &str = "Block_height";
 const CHANGE_BLOCK_FILTER_NAME: &str = "BlockChangedFilter";
 const ERROR_POLICY_TYPE: &str = "_SubgraphErrorPolicy_";
 
-#[derive(Debug, PartialEq, Eq, Copy, Clone)]
+#[derive(Debug, PartialEq, Eq, Copy, Clone, CheapClone)]
 pub enum ErrorPolicy {
     Allow,
     Deny,
@@ -864,9 +865,8 @@ fn field_filter_ops(set: FilterOpsSet<'_>) -> &'static [&'static str] {
             "not_contains",
         ],
         Object("ID") => &["", "not", "gt", "lt", "gte", "lte", "in", "not_in"],
-        Object("BigInt") | Object("BigDecimal") | Object("Int") | Object("Int8") => {
-            &["", "not", "gt", "lt", "gte", "lte", "in", "not_in"]
-        }
+        Object("BigInt") | Object("BigDecimal") | Object("Int") | Object("Int8")
+        | Object("Timestamp") => &["", "not", "gt", "lt", "gte", "lte", "in", "not_in"],
         Object("String") => &[
             "",
             "not",
@@ -892,7 +892,8 @@ fn field_filter_ops(set: FilterOpsSet<'_>) -> &'static [&'static str] {
         Aggregation("BigInt")
         | Aggregation("BigDecimal")
         | Aggregation("Int")
-        | Aggregation("Int8") => &["", "gt", "lt", "gte", "lte", "in"],
+        | Aggregation("Int8")
+        | Aggregation("Timestamp") => &["", "gt", "lt", "gte", "lte", "in"],
         Object(_) => &["", "not"],
         Aggregation(_) => &[""],
     }
@@ -1369,6 +1370,9 @@ mod tests {
         schema
             .get_named_type("Int8")
             .expect("Int8 type is missing in API schema");
+        schema
+            .get_named_type("Timestamp")
+            .expect("Timestamp type is missing in API schema");
     }
 
     #[test]
@@ -2217,13 +2221,13 @@ type Gravatar @entity {
         const SCHEMA: &str = r#"
         type Data @entity(timeseries: true) {
             id: Int8!
-            timestamp: Int8!
+            timestamp: Timestamp!
             value: BigDecimal!
         }
 
         type Stats @aggregation(source: "Data", intervals: ["hour", "day"]) {
             id: Int8!
-            timestamp: Int8!
+            timestamp: Timestamp!
             sum: BigDecimal! @aggregate(fn: "sum", arg: "value")
         }
 

@@ -15,9 +15,10 @@ use graph::{
     data_source::{
         causality_region::CausalityRegionSeq,
         offchain::{self, Base64},
-        CausalityRegion, DataSource, DataSourceTemplate, TriggerData,
+        CausalityRegion, DataSource, DataSourceTemplate,
     },
-    ipfs_client::CidFile,
+    derive::CheapClone,
+    ipfs::ContentPath,
     prelude::{
         BlockNumber, BlockPtr, BlockState, CancelGuard, CheapClone, DeploymentHash,
         MetricsRegistry, RuntimeHostBuilder, SubgraphCountMetric, SubgraphInstanceMetrics,
@@ -31,13 +32,13 @@ use std::{collections::HashMap, time::Instant};
 
 use self::instance::SubgraphInstance;
 
-#[derive(Clone, Debug)]
+use super::Decoder;
+
+#[derive(Clone, CheapClone, Debug)]
 pub struct SubgraphKeepAlive {
     alive_map: Arc<RwLock<HashMap<DeploymentId, CancelGuard>>>,
     sg_metrics: Arc<SubgraphCountMetric>,
 }
-
-impl CheapClone for SubgraphKeepAlive {}
 
 impl SubgraphKeepAlive {
     pub fn new(sg_metrics: Arc<SubgraphCountMetric>) -> Self {
@@ -57,6 +58,10 @@ impl SubgraphKeepAlive {
             self.sg_metrics.running_count.inc();
         }
     }
+
+    pub fn contains(&self, deployment_id: &DeploymentId) -> bool {
+        self.alive_map.read().unwrap().contains_key(deployment_id)
+    }
 }
 
 // The context keeps track of mutable in-memory state that is retained across blocks.
@@ -69,11 +74,12 @@ where
     T: RuntimeHostBuilder<C>,
     C: Blockchain,
 {
-    instance: SubgraphInstance<C, T>,
+    pub(crate) instance: SubgraphInstance<C, T>,
     pub instances: SubgraphKeepAlive,
     pub offchain_monitor: OffchainMonitor,
     pub filter: Option<C::TriggerFilter>,
-    trigger_processor: Box<dyn TriggerProcessor<C, T>>,
+    pub(crate) trigger_processor: Box<dyn TriggerProcessor<C, T>>,
+    pub(crate) decoder: Box<Decoder<C, T>>,
 }
 
 impl<C: Blockchain, T: RuntimeHostBuilder<C>> IndexingContext<C, T> {
@@ -85,6 +91,7 @@ impl<C: Blockchain, T: RuntimeHostBuilder<C>> IndexingContext<C, T> {
         instances: SubgraphKeepAlive,
         offchain_monitor: OffchainMonitor,
         trigger_processor: Box<dyn TriggerProcessor<C, T>>,
+        decoder: Box<Decoder<C, T>>,
     ) -> Self {
         let instance = SubgraphInstance::new(
             manifest,
@@ -99,34 +106,8 @@ impl<C: Blockchain, T: RuntimeHostBuilder<C>> IndexingContext<C, T> {
             offchain_monitor,
             filter: None,
             trigger_processor,
+            decoder,
         }
-    }
-
-    pub async fn process_trigger(
-        &self,
-        logger: &Logger,
-        block: &Arc<C::Block>,
-        trigger: &TriggerData<C>,
-        state: BlockState,
-        proof_of_indexing: &SharedProofOfIndexing,
-        causality_region: &str,
-        debug_fork: &Option<Arc<dyn SubgraphFork>>,
-        subgraph_metrics: &Arc<SubgraphInstanceMetrics>,
-        instrument: bool,
-    ) -> Result<BlockState, MappingError> {
-        self.process_trigger_in_hosts(
-            logger,
-            self.instance.hosts_for_trigger(trigger),
-            block,
-            trigger,
-            state,
-            proof_of_indexing,
-            causality_region,
-            debug_fork,
-            subgraph_metrics,
-            instrument,
-        )
-        .await
     }
 
     pub async fn process_block(
@@ -188,34 +169,6 @@ impl<C: Blockchain, T: RuntimeHostBuilder<C>> IndexingContext<C, T> {
         }
 
         Ok(state)
-    }
-    pub async fn process_trigger_in_hosts(
-        &self,
-        logger: &Logger,
-        hosts: Box<dyn Iterator<Item = &T::Host> + Send + '_>,
-        block: &Arc<C::Block>,
-        trigger: &TriggerData<C>,
-        state: BlockState,
-        proof_of_indexing: &SharedProofOfIndexing,
-        causality_region: &str,
-        debug_fork: &Option<Arc<dyn SubgraphFork>>,
-        subgraph_metrics: &Arc<SubgraphInstanceMetrics>,
-        instrument: bool,
-    ) -> Result<BlockState, MappingError> {
-        self.trigger_processor
-            .process_trigger(
-                logger,
-                hosts,
-                block,
-                trigger,
-                state,
-                proof_of_indexing,
-                causality_region,
-                debug_fork,
-                subgraph_metrics,
-                instrument,
-            )
-            .await
     }
 
     /// Removes data sources hosts with a creation block greater or equal to `reverted_block`, so
@@ -279,8 +232,8 @@ impl<C: Blockchain, T: RuntimeHostBuilder<C>> IndexingContext<C, T> {
 }
 
 pub struct OffchainMonitor {
-    ipfs_monitor: PollingMonitor<CidFile>,
-    ipfs_monitor_rx: mpsc::UnboundedReceiver<(CidFile, Bytes)>,
+    ipfs_monitor: PollingMonitor<ContentPath>,
+    ipfs_monitor_rx: mpsc::UnboundedReceiver<(ContentPath, Bytes)>,
     arweave_monitor: PollingMonitor<Base64>,
     arweave_monitor_rx: mpsc::UnboundedReceiver<(Base64, Bytes)>,
 }

@@ -3,9 +3,11 @@ use std::{sync::Arc, time::Duration};
 use crate::mapper::Mapper;
 use anyhow::{Context, Error};
 use graph::blockchain::block_stream::{BlockStreamError, FirehoseCursor};
+use graph::blockchain::BlockchainKind;
 use graph::blockchain::{
     client::ChainClient, substreams_block_stream::SubstreamsBlockStream, BlockIngestor,
 };
+use graph::components::network_provider::ChainName;
 use graph::prelude::MetricsRegistry;
 use graph::slog::trace;
 use graph::substreams::Package;
@@ -27,7 +29,7 @@ pub struct SubstreamsBlockIngestor {
     chain_store: Arc<dyn ChainStore>,
     client: Arc<ChainClient<super::Chain>>,
     logger: Logger,
-    chain_name: String,
+    chain_name: ChainName,
     metrics: Arc<MetricsRegistry>,
 }
 
@@ -36,7 +38,7 @@ impl SubstreamsBlockIngestor {
         chain_store: Arc<dyn ChainStore>,
         client: Arc<ChainClient<super::Chain>>,
         logger: Logger,
-        chain_name: String,
+        chain_name: ChainName,
         metrics: Arc<MetricsRegistry>,
     ) -> SubstreamsBlockIngestor {
         SubstreamsBlockIngestor {
@@ -157,7 +159,7 @@ impl BlockIngestor for SubstreamsBlockIngestor {
                 None,
                 latest_cursor.clone(),
                 mapper.cheap_clone(),
-                package.modules.clone(),
+                package.modules.clone().unwrap_or_default(),
                 "map_blocks".to_string(),
                 vec![-1],
                 vec![],
@@ -169,9 +171,14 @@ impl BlockIngestor for SubstreamsBlockIngestor {
             // If the error is retryable it will print the error and return the cursor
             // therefore if we get an error here it has to be a fatal error.
             // This is a bit brittle and should probably be improved at some point.
-            let res = self.process_blocks(latest_cursor, stream).await;
+            let res = self.process_blocks(latest_cursor.clone(), stream).await;
             match res {
-                Ok(cursor) => latest_cursor = cursor,
+                Ok(cursor) => {
+                    if cursor.as_ref() != latest_cursor.as_ref() {
+                        backoff.reset();
+                        latest_cursor = cursor;
+                    }
+                }
                 Err(BlockStreamError::Fatal(e)) => {
                     error!(
                         self.logger,
@@ -187,7 +194,10 @@ impl BlockIngestor for SubstreamsBlockIngestor {
         }
     }
 
-    fn network_name(&self) -> String {
+    fn network_name(&self) -> ChainName {
         self.chain_name.clone()
+    }
+    fn kind(&self) -> BlockchainKind {
+        BlockchainKind::Substreams
     }
 }

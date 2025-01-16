@@ -323,8 +323,6 @@ mod public {
 // the `large_notifications` table.
 #[derive(Debug)]
 pub struct JsonNotification {
-    pub process_id: i32,
-    pub channel: String,
     pub payload: serde_json::Value,
 }
 
@@ -373,16 +371,10 @@ impl JsonNotification {
                 let payload: String = payload_rows.get(0).unwrap().get(0);
 
                 Ok(JsonNotification {
-                    process_id: notification.process_id(),
-                    channel: notification.channel().to_string(),
                     payload: serde_json::from_str(&payload)?,
                 })
             }
-            serde_json::Value::Object(_) => Ok(JsonNotification {
-                process_id: notification.process_id(),
-                channel: notification.channel().to_string(),
-                payload: value,
-            }),
+            serde_json::Value::Object(_) => Ok(JsonNotification { payload: value }),
             _ => Err(anyhow!("JSON notifications must be numbers or objects"))?,
         }
     }
@@ -413,7 +405,7 @@ impl NotificationSender {
     /// metrics gathering and does not affect how the notification is sent
     pub fn notify(
         &self,
-        conn: &PgConnection,
+        conn: &mut PgConnection,
         channel: &str,
         network: Option<&str>,
         data: &serde_json::Value,
@@ -422,7 +414,7 @@ impl NotificationSender {
         use diesel::RunQueryDsl;
         use public::large_notifications::dsl::*;
 
-        sql_function! {
+        define_sql_function! {
             fn pg_notify(channel: Text, msg: Text)
         }
 

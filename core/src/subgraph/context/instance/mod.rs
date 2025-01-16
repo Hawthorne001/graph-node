@@ -1,7 +1,7 @@
 mod hosts;
 
 use anyhow::ensure;
-use futures01::sync::mpsc::Sender;
+use graph::futures01::sync::mpsc::Sender;
 use graph::{
     blockchain::{Blockchain, TriggerData as _},
     data_source::{
@@ -13,7 +13,7 @@ use graph::{
 use hosts::{OffchainHosts, OnchainHosts};
 use std::collections::HashMap;
 
-pub(super) struct SubgraphInstance<C: Blockchain, T: RuntimeHostBuilder<C>> {
+pub(crate) struct SubgraphInstance<C: Blockchain, T: RuntimeHostBuilder<C>> {
     subgraph_id: DeploymentHash,
     network: String,
     host_builder: T,

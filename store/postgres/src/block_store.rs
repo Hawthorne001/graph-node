@@ -6,13 +6,15 @@ use std::{
 
 use anyhow::anyhow;
 use diesel::{
+    query_dsl::methods::FilterDsl as _,
     r2d2::{ConnectionManager, PooledConnection},
-    sql_query, PgConnection, RunQueryDsl,
+    sql_query, ExpressionMethods as _, PgConnection, RunQueryDsl,
 };
+use graph::components::network_provider::ChainName;
 use graph::{
     blockchain::ChainIdentifier,
     components::store::{BlockStore as BlockStoreTrait, QueryPermit},
-    prelude::{error, info, warn, BlockNumber, BlockPtr, Logger, ENV_VARS},
+    prelude::{error, info, BlockNumber, BlockPtr, Logger, ENV_VARS},
     slog::o,
 };
 use graph::{constraint_violation, prelude::CheapClone};
@@ -30,6 +32,10 @@ use self::primary::Chain;
 
 #[cfg(debug_assertions)]
 pub const FAKE_NETWORK_SHARED: &str = "fake_network_shared";
+
+// Highest version of the database that the executable supports.
+// To be incremented on each breaking change to the database.
+const SUPPORTED_DB_VERSION: i64 = 3;
 
 /// The status of a chain: whether we can only read from the chain, or
 /// whether it is ok to ingest from it, too
@@ -98,11 +104,11 @@ pub mod primary {
         }
     }
 
-    pub fn load_chains(conn: &PgConnection) -> Result<Vec<Chain>, StoreError> {
+    pub fn load_chains(conn: &mut PgConnection) -> Result<Vec<Chain>, StoreError> {
         Ok(chains::table.load(conn)?)
     }
 
-    pub fn find_chain(conn: &PgConnection, name: &str) -> Result<Option<Chain>, StoreError> {
+    pub fn find_chain(conn: &mut PgConnection, name: &str) -> Result<Option<Chain>, StoreError> {
         Ok(chains::table
             .filter(chains::name.eq(name))
             .first(conn)
@@ -110,10 +116,10 @@ pub mod primary {
     }
 
     pub fn add_chain(
-        conn: &PooledConnection<ConnectionManager<PgConnection>>,
+        conn: &mut PooledConnection<ConnectionManager<PgConnection>>,
         name: &str,
-        ident: &ChainIdentifier,
         shard: &Shard,
+        ident: ChainIdentifier,
     ) -> Result<Chain, StoreError> {
         // For tests, we want to have a chain that still uses the
         // shared `ethereum_blocks` table
@@ -147,20 +153,31 @@ pub mod primary {
     }
 
     pub(super) fn drop_chain(pool: &ConnectionPool, name: &str) -> Result<(), StoreError> {
-        let conn = pool.get()?;
+        let mut conn = pool.get()?;
 
-        delete(chains::table.filter(chains::name.eq(name))).execute(&conn)?;
+        delete(chains::table.filter(chains::name.eq(name))).execute(&mut conn)?;
         Ok(())
     }
 
     // update chain name where chain name is 'name'
     pub fn update_chain_name(
-        conn: &PooledConnection<ConnectionManager<PgConnection>>,
+        conn: &mut PooledConnection<ConnectionManager<PgConnection>>,
         name: &str,
         new_name: &str,
     ) -> Result<(), StoreError> {
         update(chains::table.filter(chains::name.eq(name)))
             .set(chains::name.eq(new_name))
+            .execute(conn)?;
+        Ok(())
+    }
+
+    pub fn update_chain_genesis_hash(
+        conn: &mut PooledConnection<ConnectionManager<PgConnection>>,
+        name: &str,
+        hash: BlockHash,
+    ) -> Result<(), StoreError> {
+        update(chains::table.filter(chains::name.eq(name)))
+            .set(chains::genesis_block_hash.eq(hash.hash_hex()))
             .execute(conn)?;
         Ok(())
     }
@@ -194,6 +211,8 @@ pub struct BlockStore {
     /// known to the system at startup, either from configuration or from
     /// previous state in the database.
     stores: RwLock<HashMap<String, Arc<ChainStore>>>,
+    // We keep this information so we can create chain stores during startup
+    shards: Vec<(String, Shard)>,
     pools: HashMap<Shard, ConnectionPool>,
     sender: Arc<NotificationSender>,
     mirror: PrimaryMirror,
@@ -215,8 +234,8 @@ impl BlockStore {
     /// a chain uses the pool from `pools` for the given shard.
     pub fn new(
         logger: Logger,
-        // (network, ident, shard)
-        chains: Vec<(String, ChainIdentifier, Shard)>,
+        // (network, shard)
+        shards: Vec<(String, Shard)>,
         // shard -> pool
         pools: HashMap<Shard, ConnectionPool>,
         sender: Arc<NotificationSender>,
@@ -229,10 +248,12 @@ impl BlockStore {
         let mirror = PrimaryMirror::new(&pools);
         let existing_chains = mirror.read(|conn| primary::load_chains(conn))?;
         let chain_head_cache = TimedCache::new(CHAIN_HEAD_CACHE_TTL);
+        let chains = shards.clone();
 
         let block_store = Self {
             logger,
             stores: RwLock::new(HashMap::new()),
+            shards,
             pools,
             sender,
             mirror,
@@ -246,7 +267,7 @@ impl BlockStore {
             logger: &Logger,
             chain: &primary::Chain,
             shard: &Shard,
-            ident: &ChainIdentifier,
+            // ident: &ChainIdentifier,
         ) -> bool {
             if &chain.shard != shard {
                 error!(
@@ -258,54 +279,24 @@ impl BlockStore {
                 );
                 return false;
             }
-            if chain.net_version != ident.net_version {
-                if chain.net_version == "0" {
-                    warn!(logger,
-                        "the net version for chain {} has changed from 0 to {} since the last time we ran, ignoring difference because 0 means UNSET and firehose does not provide it",
-                        chain.name,
-                        ident.net_version,
-                        )
-                } else {
-                    error!(logger,
-                        "the net version for chain {} has changed from {} to {} since the last time we ran",
-                        chain.name,
-                        chain.net_version,
-                        ident.net_version
-                    );
-                    return false;
-                }
-            }
-            if chain.genesis_block != ident.genesis_block_hash.hash_hex() {
-                error!(logger,
-                        "the genesis block hash for chain {} has changed from {} to {} since the last time we ran",
-                        chain.name,
-                        chain.genesis_block,
-                        ident.genesis_block_hash
-                    );
-                return false;
-            }
             true
         }
 
         // For each configured chain, add a chain store
-        for (chain_name, ident, shard) in chains {
+        for (chain_name, shard) in chains {
             match existing_chains
                 .iter()
                 .find(|chain| chain.name == chain_name)
             {
                 Some(chain) => {
-                    let status = if chain_ingestible(&block_store.logger, chain, &shard, &ident) {
+                    let status = if chain_ingestible(&block_store.logger, chain, &shard) {
                         ChainStatus::Ingestible
                     } else {
                         ChainStatus::ReadOnly
                     };
                     block_store.add_chain_store(chain, status, false)?;
                 }
-                None => {
-                    let conn = block_store.mirror.primary().get()?;
-                    let chain = primary::add_chain(&conn, &chain_name, &ident, &shard)?;
-                    block_store.add_chain_store(&chain, ChainStatus::Ingestible, true)?;
-                }
+                None => {}
             };
         }
 
@@ -336,14 +327,14 @@ impl BlockStore {
     }
 
     pub fn allocate_chain(
-        conn: &PooledConnection<ConnectionManager<PgConnection>>,
+        conn: &mut PooledConnection<ConnectionManager<PgConnection>>,
         name: &String,
         shard: &Shard,
         ident: &ChainIdentifier,
     ) -> Result<Chain, StoreError> {
         #[derive(QueryableByName, Debug)]
         struct ChainIdSeq {
-            #[sql_type = "diesel::sql_types::BigInt"]
+            #[diesel(sql_type = diesel::sql_types::BigInt)]
             last_value: i64,
         }
 
@@ -392,7 +383,6 @@ impl BlockStore {
             logger,
             chain.name.clone(),
             chain.storage.clone(),
-            &ident,
             status,
             sender,
             pool,
@@ -419,12 +409,12 @@ impl BlockStore {
             let cached = match self.chain_head_cache.get(shard.as_str()) {
                 Some(cached) => cached,
                 None => {
-                    let conn = match pool.get() {
+                    let mut conn = match pool.get() {
                         Ok(conn) => conn,
                         Err(StoreError::DatabaseUnavailable) => continue,
                         Err(e) => return Err(e),
                     };
-                    let heads = Arc::new(ChainStore::chain_head_pointers(&conn)?);
+                    let heads = Arc::new(ChainStore::chain_head_pointers(&mut conn)?);
                     self.chain_head_cache.set(shard.to_string(), heads.clone());
                     heads
                 }
@@ -509,18 +499,12 @@ impl BlockStore {
     // Discussed here: https://github.com/graphprotocol/graph-node/pull/4790
     pub fn cleanup_ethereum_shallow_blocks(
         &self,
-        ethereum_networks: Vec<&String>,
-        firehose_only_networks: Option<Vec<&String>>,
+        eth_rpc_only_nets: Vec<String>,
     ) -> Result<(), StoreError> {
         for store in self.stores.read().unwrap().values() {
-            if !ethereum_networks.contains(&&store.chain) {
+            if !eth_rpc_only_nets.contains(&&store.chain) {
                 continue;
             };
-            if let Some(fh_nets) = firehose_only_networks.clone() {
-                if fh_nets.contains(&&store.chain) {
-                    continue;
-                };
-            }
 
             if let Some(head_block) = store.remove_cursor(&&store.chain)? {
                 let lower_bound = head_block.saturating_sub(ENV_VARS.reorg_threshold * 2);
@@ -543,14 +527,48 @@ impl BlockStore {
         use diesel::prelude::*;
 
         let primary_pool = self.pools.get(&*PRIMARY_SHARD).unwrap();
-        let connection = primary_pool.get()?;
-        let version: i64 = dbv::table.select(dbv::version).get_result(&connection)?;
+        let mut conn = primary_pool.get()?;
+        let version: i64 = dbv::table.select(dbv::version).get_result(&mut conn)?;
         if version < 3 {
             self.truncate_block_caches()?;
             diesel::update(dbv::table)
                 .set(dbv::version.eq(3))
-                .execute(&connection)?;
+                .execute(&mut conn)?;
         };
+        if version < SUPPORTED_DB_VERSION {
+            // Bump it to make sure that all executables are working with the same DB format
+            diesel::update(dbv::table)
+                .set(dbv::version.eq(SUPPORTED_DB_VERSION))
+                .execute(&mut conn)?;
+        };
+        if version > SUPPORTED_DB_VERSION {
+            panic!(
+                "The executable is too old and doesn't support the database version: {}",
+                version
+            )
+        }
+        Ok(())
+    }
+
+    /// Updates the chains table of the primary shard. This table is replicated to other shards and
+    /// has to be refreshed afterwards for the update to be reflected.
+    pub fn set_chain_identifier(
+        &self,
+        chain_id: ChainName,
+        ident: &ChainIdentifier,
+    ) -> Result<(), StoreError> {
+        use primary::chains as c;
+
+        let primary_pool = self.pools.get(&*PRIMARY_SHARD).unwrap();
+        let mut conn = primary_pool.get()?;
+
+        diesel::update(c::table.filter(c::name.eq(chain_id.as_str())))
+            .set((
+                c::genesis_block_hash.eq(ident.genesis_block_hash.hash_hex()),
+                c::net_version.eq(&ident.net_version),
+            ))
+            .execute(&mut conn)?;
+
         Ok(())
     }
 }
@@ -560,5 +578,34 @@ impl BlockStoreTrait for BlockStore {
 
     fn chain_store(&self, network: &str) -> Option<Arc<Self::ChainStore>> {
         self.store(network)
+    }
+
+    fn create_chain_store(
+        &self,
+        network: &str,
+        ident: ChainIdentifier,
+    ) -> anyhow::Result<Arc<Self::ChainStore>> {
+        match self.store(network) {
+            Some(chain_store) => {
+                return Ok(chain_store);
+            }
+            None => {}
+        }
+
+        let mut conn = self.mirror.primary().get()?;
+        let shard = self
+            .shards
+            .iter()
+            .find_map(|(chain_id, shard)| {
+                if chain_id.as_str().eq(network) {
+                    Some(shard)
+                } else {
+                    None
+                }
+            })
+            .ok_or_else(|| anyhow!("unable to find shard for network {}", network))?;
+        let chain = primary::add_chain(&mut conn, &network, &shard, ident)?;
+        self.add_chain_store(&chain, ChainStatus::Ingestible, true)
+            .map_err(anyhow::Error::from)
     }
 }

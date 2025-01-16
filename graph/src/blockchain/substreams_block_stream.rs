@@ -4,6 +4,7 @@ use super::block_stream::{
 use super::client::ChainClient;
 use crate::blockchain::block_stream::{BlockStream, BlockStreamEvent};
 use crate::blockchain::Blockchain;
+use crate::firehose::ConnectionHeaders;
 use crate::prelude::*;
 use crate::substreams::Modules;
 use crate::substreams_rpc::{ModulesProgress, Request, Response};
@@ -115,7 +116,7 @@ where
         subgraph_current_block: Option<BlockPtr>,
         cursor: FirehoseCursor,
         mapper: Arc<F>,
-        modules: Option<Modules>,
+        modules: Modules,
         module_name: String,
         start_blocks: Vec<BlockNumber>,
         end_blocks: Vec<BlockNumber>,
@@ -154,7 +155,7 @@ fn stream_blocks<C: Blockchain, F: BlockStreamMapper<C>>(
     cursor: FirehoseCursor,
     deployment: DeploymentHash,
     mapper: Arc<F>,
-    modules: Option<Modules>,
+    modules: Modules,
     module_name: String,
     manifest_start_block_num: BlockNumber,
     manifest_end_block_num: BlockNumber,
@@ -174,6 +175,8 @@ fn stream_blocks<C: Blockchain, F: BlockStreamMapper<C>>(
 
     let stop_block_num = manifest_end_block_num as u64;
 
+    let headers = ConnectionHeaders::new().with_deployment(deployment.clone());
+
     // Back off exponentially whenever we encounter a connection error or a stream with bad data
     let mut backoff = ExponentialBackoff::new(Duration::from_millis(500), Duration::from_secs(45));
 
@@ -184,7 +187,14 @@ fn stream_blocks<C: Blockchain, F: BlockStreamMapper<C>>(
     let mut log_data = SubstreamsLogData::new();
 
     try_stream! {
-            let endpoint = client.firehose_endpoint()?;
+            if !modules.modules.iter().any(|m| module_name.eq(&m.name)) {
+                Err(BlockStreamError::Fatal(format!(
+                    "module `{}` not found",
+                    module_name
+                )))?;
+            }
+
+            let endpoint = client.firehose_endpoint().await?;
             let mut logger = logger.new(o!("deployment" => deployment.clone(), "provider" => endpoint.provider.to_string()));
 
         loop {
@@ -196,14 +206,14 @@ fn stream_blocks<C: Blockchain, F: BlockStreamMapper<C>>(
                 start_block_num,
                 start_cursor: latest_cursor.to_string(),
                 stop_block_num,
-                modules: modules.clone(),
+                modules: Some(modules.clone()),
                 output_module: module_name.clone(),
                 production_mode: true,
                 ..Default::default()
             };
 
 
-            let result = endpoint.clone().substreams(request).await;
+            let result = endpoint.clone().substreams(request, &headers).await;
 
             match result {
                 Ok(stream) => {

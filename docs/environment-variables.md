@@ -53,6 +53,13 @@ those.
   be used if the store uses more than one shard.
 - `GRAPH_ETHEREUM_GENESIS_BLOCK_NUMBER`: Specify genesis block number. If the flag
   is not set, the default value will be `0`.
+- `GRAPH_ETH_GET_LOGS_MAX_CONTRACTS`: Maximum number of contracts to query in a single `eth_getLogs` request.
+  Defaults to 2000.
+
+## Firehose configuration
+
+- `GRAPH_NODE_FIREHOSE_MAX_DECODE_SIZE`: Maximum size of a message that can be
+  decoded by the firehose. Defaults to 25MB.
 
 ## Running mapping handlers
 
@@ -80,7 +87,7 @@ those.
 - `GRAPH_MAX_IPFS_CACHE_SIZE`: maximum number of files cached (defaults to 50).
 - `GRAPH_MAX_IPFS_CACHE_FILE_SIZE`: maximum size of each cached file (in bytes, defaults to 1MiB).
 - `GRAPH_IPFS_REQUEST_LIMIT`: Limits the number of requests per second to IPFS for file data sources.
-   Defaults to 100.
+  Defaults to 100.
 
 ## GraphQL
 
@@ -142,6 +149,10 @@ those.
 - `GRAPH_QUERY_CACHE_BLOCKS`: How many recent blocks per network should be kept in the query cache. This should be kept small since the lookup time and the cache memory usage are proportional to this value. Set to 0 to disable the cache. Defaults to 1.
 - `GRAPH_QUERY_CACHE_MAX_MEM`: Maximum total memory to be used by the query cache, in MB. The total amount of memory used for caching will be twice this value - once for recent blocks, divided evenly among the `GRAPH_QUERY_CACHE_BLOCKS`, and once for frequent queries against older blocks. The default is plenty for most loads, particularly if `GRAPH_QUERY_CACHE_BLOCKS` is kept small. Defaults to 1000, which corresponds to 1GB.
 - `GRAPH_QUERY_CACHE_STALE_PERIOD`: Number of queries after which a cache entry can be considered stale. Defaults to 100.
+- `GRAPH_QUERY_CACHE_MAX_ENTRY_RATIO`: Limits the maximum size of a cache
+  entry. Query results larger than the size of a cache shard divided by this
+  value will not be cached. The default is 3. A value of 0 means that there
+  is no limit on the size of a cache entry.
 
 ## Miscellaneous
 
@@ -247,3 +258,11 @@ those.
 - `GRAPH_STORE_WRITE_BATCH_SIZE`: how many changes to accumulate during
   syncing in kilobytes before a write has to happen. The default is 10_000
   which corresponds to 10MB. Setting this to 0 disables write batching.
+- `GRAPH_MIN_HISTORY_BLOCKS`: Specifies the minimum number of blocks to
+  retain for subgraphs with historyBlocks set to auto. The default value is 2 times the reorg threshold.
+- `GRAPH_ETHEREUM_BLOCK_RECEIPTS_CHECK_TIMEOUT`: Timeout for checking
+  `eth_getBlockReceipts` support during chain startup, if this times out
+  individual transaction receipts will be fetched instead. Defaults to 10s.
+- `GRAPH_POSTPONE_ATTRIBUTE_INDEX_CREATION`: During the coping of a subgraph
+  postponing creation of certain indexes (btree, attribute based ones), would
+  speed up syncing

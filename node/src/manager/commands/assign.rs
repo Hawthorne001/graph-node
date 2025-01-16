@@ -1,3 +1,4 @@
+use graph::components::store::DeploymentLocator;
 use graph::prelude::{anyhow::anyhow, Error, NodeId, StoreEvent};
 use graph_store_postgres::{
     command_support::catalog, connection_pool::ConnectionPool, NotificationSender,
@@ -14,8 +15,8 @@ pub async fn unassign(
 ) -> Result<(), Error> {
     let locator = search.locate_unique(&primary)?;
 
-    let conn = primary.get()?;
-    let conn = catalog::Connection::new(conn);
+    let pconn = primary.get()?;
+    let mut conn = catalog::Connection::new(pconn);
 
     let site = conn
         .locate_site(locator.clone())?
@@ -37,8 +38,8 @@ pub fn reassign(
     let node = NodeId::new(node.clone()).map_err(|()| anyhow!("illegal node id `{}`", node))?;
     let locator = search.locate_unique(&primary)?;
 
-    let conn = primary.get()?;
-    let conn = catalog::Connection::new(conn);
+    let pconn = primary.get()?;
+    let mut conn = catalog::Connection::new(pconn);
 
     let site = conn
         .locate_site(locator.clone())?
@@ -75,13 +76,11 @@ pub fn reassign(
 pub fn pause_or_resume(
     primary: ConnectionPool,
     sender: &NotificationSender,
-    search: &DeploymentSearch,
+    locator: &DeploymentLocator,
     should_pause: bool,
 ) -> Result<(), Error> {
-    let locator = search.locate_unique(&primary)?;
-
-    let conn = primary.get()?;
-    let conn = catalog::Connection::new(conn);
+    let pconn = primary.get()?;
+    let mut conn = catalog::Connection::new(pconn);
 
     let site = conn
         .locate_site(locator.clone())?
@@ -115,15 +114,15 @@ pub fn pause_or_resume(
 pub fn restart(
     primary: ConnectionPool,
     sender: &NotificationSender,
-    search: &DeploymentSearch,
+    locator: &DeploymentLocator,
     sleep: Duration,
 ) -> Result<(), Error> {
-    pause_or_resume(primary.clone(), sender, search, true)?;
+    pause_or_resume(primary.clone(), sender, locator, true)?;
     println!(
         "Waiting {}s to make sure pausing was processed",
         sleep.as_secs()
     );
     thread::sleep(sleep);
-    pause_or_resume(primary, sender, search, false)?;
+    pause_or_resume(primary, sender, locator, false)?;
     Ok(())
 }

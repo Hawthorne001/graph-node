@@ -18,6 +18,7 @@ use crate::data::store::{
     self, EntityValidationError, IdType, IntoEntityIterator, TryIntoEntityIterator, ValueType, ID,
 };
 use crate::data::value::Word;
+use crate::derive::CheapClone;
 use crate::prelude::q::Value;
 use crate::prelude::{s, DeploymentHash};
 use crate::schema::api::api_schema;
@@ -58,7 +59,7 @@ pub mod kw {
 ///
 /// There's no need to put this into an `Arc`, since `InputSchema` already
 /// does that internally and is `CheapClone`
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, CheapClone, Debug, PartialEq)]
 pub struct InputSchema {
     inner: Arc<Inner>,
 }
@@ -303,6 +304,19 @@ pub enum ObjectOrInterface<'a> {
     Interface(&'a InputSchema, &'a InterfaceType),
 }
 
+impl<'a> CheapClone for ObjectOrInterface<'a> {
+    fn cheap_clone(&self) -> Self {
+        match self {
+            ObjectOrInterface::Object(schema, object) => {
+                ObjectOrInterface::Object(*schema, *object)
+            }
+            ObjectOrInterface::Interface(schema, interface) => {
+                ObjectOrInterface::Interface(*schema, *interface)
+            }
+        }
+    }
+}
+
 impl<'a> ObjectOrInterface<'a> {
     pub fn object_types(self) -> Vec<EntityType> {
         let (schema, object_types) = match self {
@@ -378,8 +392,6 @@ impl<'a> ObjectOrInterface<'a> {
         }
     }
 }
-
-impl CheapClone for ObjectOrInterface<'_> {}
 
 impl std::fmt::Debug for ObjectOrInterface<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -917,7 +929,7 @@ impl Aggregation {
 
     pub fn dimensions(&self) -> impl Iterator<Item = &Field> {
         self.fields
-            .into_iter()
+            .iter()
             .filter(|field| &field.name != &*ID && field.name != kw::TIMESTAMP)
     }
 
@@ -942,14 +954,6 @@ pub struct Inner {
     pool: Arc<AtomPool>,
     /// A list of all timeseries types by interval
     agg_mappings: Box<[AggregationMapping]>,
-}
-
-impl CheapClone for InputSchema {
-    fn cheap_clone(&self) -> Self {
-        InputSchema {
-            inner: self.inner.cheap_clone(),
-        }
-    }
 }
 
 impl InputSchema {
@@ -1236,7 +1240,7 @@ impl InputSchema {
         };
         Ok(obj_type
             .shared_interfaces
-            .into_iter()
+            .iter()
             .map(|atom| EntityType::new(self.cheap_clone(), *atom))
             .collect())
     }
@@ -1315,6 +1319,18 @@ impl InputSchema {
         self.inner.enum_map.values(name)
     }
 
+    pub fn immutable_entities<'a>(&'a self) -> impl Iterator<Item = EntityType> + 'a {
+        self.inner
+            .type_infos
+            .iter()
+            .filter_map(|ti| match ti {
+                TypeInfo::Object(obj_type) => Some(obj_type),
+                TypeInfo::Interface(_) | TypeInfo::Aggregation(_) => None,
+            })
+            .filter(|obj_type| obj_type.immutable)
+            .map(|obj_type| EntityType::new(self.cheap_clone(), obj_type.name))
+    }
+
     /// Return a list of the entity types defined in the schema, i.e., the
     /// types that have a `@entity` annotation. This does not include the
     /// type for the PoI
@@ -1347,6 +1363,13 @@ impl InputSchema {
     /// `interval` of the aggregations are non-decreasing
     pub fn agg_mappings(&self) -> impl Iterator<Item = &AggregationMapping> {
         self.inner.agg_mappings.iter()
+    }
+
+    pub fn has_bytes_as_ids(&self) -> bool {
+        self.inner
+            .type_infos
+            .iter()
+            .any(|ti| ti.id_type() == Some(store::IdType::Bytes))
     }
 
     pub fn has_aggregations(&self) -> bool {
@@ -2625,8 +2648,7 @@ mod validations {
             errors
         }
 
-        /// Aggregations must have a `timestamp` field of type Int8
-        /// FIXME: introduce a timestamp type and use that
+        /// Aggregations must have a `timestamp` field of type `Timestamp`
         fn valid_timestamp_field(agg_type: &s::ObjectType) -> Option<Err> {
             let field = match agg_type.field(kw::TIMESTAMP) {
                 Some(field) => field,
@@ -2636,7 +2658,7 @@ mod validations {
             };
 
             match field.field_type.value_type() {
-                Ok(ValueType::Int8) => None,
+                Ok(ValueType::Timestamp) => None,
                 Ok(_) | Err(_) => Some(Err::InvalidTimestampType(
                     agg_type.name.to_owned(),
                     field.field_type.get_base_type().to_owned(),
@@ -3096,13 +3118,13 @@ mod tests {
       type HippoData @entity(timeseries: true) {
         id: Int8!
         hippo: Hippo!
-        timestamp: Int8!
+        timestamp: Timestamp!
         weight: BigDecimal!
       }
 
       type HippoStats @aggregation(intervals: ["hour"], source: "HippoData") {
         id: Int8!
-        timestamp: Int8!
+        timestamp: Timestamp!
         hippo: Hippo!
         maxWeight: BigDecimal! @aggregate(fn: "max", arg:"weight")
       }

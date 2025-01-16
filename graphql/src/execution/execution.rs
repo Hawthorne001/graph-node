@@ -6,6 +6,7 @@ use graph::{
         query::Trace,
         value::{Object, Word},
     },
+    futures03::future::TryFutureExt,
     prelude::{s, CheapClone},
     schema::{is_introspection_field, INTROSPECTION_QUERY_TYPE, META_FIELD_NAME},
     util::{herd_cache::HerdCache, lfu_cache::EvictStats, timed_rw_lock::TimedMutex},
@@ -27,18 +28,34 @@ use crate::execution::ast as a;
 use crate::prelude::*;
 
 lazy_static! {
+    // The maximum weight of each cache shard, evenly dividing the total
+    // cache memory across shards
+    static ref MAX_WEIGHT: usize = {
+        let shards = ENV_VARS.graphql.query_block_cache_shards;
+        let blocks = ENV_VARS.graphql.query_cache_blocks;
+
+        ENV_VARS.graphql.query_cache_max_mem / (blocks * shards as usize)
+    };
+
+    // We will not add entries to the cache that exceed this weight.
+    static ref MAX_ENTRY_WEIGHT: usize = {
+        if ENV_VARS.graphql.query_cache_max_entry_ratio == 0 {
+            usize::MAX
+        } else {
+        *MAX_WEIGHT / ENV_VARS.graphql.query_cache_max_entry_ratio
+        }
+    };
+
     // Sharded query results cache for recent blocks by network.
     // The `VecDeque` works as a ring buffer with a capacity of `QUERY_CACHE_BLOCKS`.
     static ref QUERY_BLOCK_CACHE: Vec<TimedMutex<QueryBlockCache>> = {
             let shards = ENV_VARS.graphql.query_block_cache_shards;
             let blocks = ENV_VARS.graphql.query_cache_blocks;
 
-            // The memory budget is evenly divided among blocks and their shards.
-            let max_weight = ENV_VARS.graphql.query_cache_max_mem / (blocks * shards as usize);
             let mut caches = Vec::new();
             for i in 0..shards {
                 let id = format!("query_block_cache_{}", i);
-                caches.push(TimedMutex::new(QueryBlockCache::new(blocks, i, max_weight), id))
+                caches.push(TimedMutex::new(QueryBlockCache::new(blocks, i, *MAX_WEIGHT), id))
             }
             caches
     };
@@ -355,24 +372,27 @@ pub(crate) async fn execute_root_selection_set<R: Resolver>(
     let execute_root_type = root_type.cheap_clone();
     let run_query = async move {
         let _permit = execute_ctx.resolver.query_permit().await;
+        let query_start = Instant::now();
 
         let logger = execute_ctx.logger.clone();
         let query_text = execute_ctx.query.query_text.cheap_clone();
         let variables_text = execute_ctx.query.variables_text.cheap_clone();
         match graph::spawn_blocking_allow_panic(move || {
-            let mut query_res =
-                QueryResult::from(graph::block_on(execute_root_selection_set_uncached(
+            let mut query_res = QueryResult::from(
+                graph::block_on(execute_root_selection_set_uncached(
                     &execute_ctx,
                     &execute_selection_set,
                     &execute_root_type,
-                )));
+                ))
+                .map(|(obj, mut trace)| {
+                    trace.query_done(query_start.elapsed(), &_permit);
+                    (obj, trace)
+                }),
+            );
 
             // Unwrap: In practice should never fail, but if it does we will catch the panic.
             execute_ctx.resolver.post_process(&mut query_res).unwrap();
             query_res.deployment = Some(execute_ctx.query.schema.id().clone());
-            if let Ok(qp) = _permit {
-                query_res.trace.permit_wait(qp.wait);
-            }
             Arc::new(query_res)
         })
         .await
@@ -416,7 +436,7 @@ pub(crate) async fn execute_root_selection_set<R: Resolver>(
     // In particular, there is a problem where asking for a block pointer beyond the chain
     // head can cause the legitimate cache to be thrown out.
     // It would be redundant to insert herd cache hits.
-    let no_cache = herd_hit || result.has_errors();
+    let no_cache = herd_hit || result.has_errors() || result.weight() > *MAX_ENTRY_WEIGHT;
     if let (false, Some(key), Some(block_ptr), Some(network)) =
         (no_cache, key, block_ptr, &ctx.query.network)
     {

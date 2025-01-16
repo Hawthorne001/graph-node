@@ -17,6 +17,7 @@ use crate::anyhow::Result;
 use crate::components::store::{BlockNumber, DeploymentLocator};
 use crate::data::subgraph::UnifiedMappingApiVersion;
 use crate::firehose::{self, FirehoseEndpoint};
+use crate::futures03::stream::StreamExt as _;
 use crate::schema::InputSchema;
 use crate::substreams_rpc::response::Message;
 use crate::{prelude::*, prometheus::labels};
@@ -259,14 +260,15 @@ impl<C: Blockchain> BlockWithTriggers<C> {
 
 #[async_trait]
 pub trait TriggersAdapter<C: Blockchain>: Send + Sync {
-    // Return the block that is `offset` blocks before the block pointed to
-    // by `ptr` from the local cache. An offset of 0 means the block itself,
-    // an offset of 1 means the block's parent etc. If the block is not in
-    // the local cache, return `None`
+    // Return the block that is `offset` blocks before the block pointed to by `ptr` from the local
+    // cache. An offset of 0 means the block itself, an offset of 1 means the block's parent etc. If
+    // `root` is passed, short-circuit upon finding a child of `root`. If the block is not in the
+    // local cache, return `None`.
     async fn ancestor_block(
         &self,
         ptr: BlockPtr,
         offset: BlockNumber,
+        root: Option<BlockHash>,
     ) -> Result<Option<C::Block>, Error>;
 
     // Returns a sequence of blocks in increasing order of block number.
@@ -280,7 +282,7 @@ pub trait TriggersAdapter<C: Blockchain>: Send + Sync {
         from: BlockNumber,
         to: BlockNumber,
         filter: &C::TriggerFilter,
-    ) -> Result<Vec<BlockWithTriggers<C>>, Error>;
+    ) -> Result<(Vec<BlockWithTriggers<C>>, BlockNumber), Error>;
 
     // Used for reprocessing blocks when creating a data source.
     async fn triggers_in_block(
@@ -539,6 +541,16 @@ pub enum BlockStreamEvent<C: Blockchain> {
     ProcessWasmBlock(BlockPtr, BlockTime, Box<[u8]>, String, FirehoseCursor),
 }
 
+impl<C: Blockchain> BlockStreamEvent<C> {
+    pub fn block_ptr(&self) -> BlockPtr {
+        match self {
+            BlockStreamEvent::Revert(ptr, _) => ptr.clone(),
+            BlockStreamEvent::ProcessBlock(block, _) => block.ptr(),
+            BlockStreamEvent::ProcessWasmBlock(ptr, _, _, _, _) => ptr.clone(),
+        }
+    }
+}
+
 impl<C: Blockchain> Clone for BlockStreamEvent<C>
 where
     C::TriggerData: Clone,
@@ -561,7 +573,6 @@ where
 #[derive(Clone)]
 pub struct BlockStreamMetrics {
     pub deployment_head: Box<Gauge>,
-    pub deployment_failed: Box<Gauge>,
     pub reverted_blocks: Gauge,
     pub stopwatch: StopwatchMetrics,
 }
@@ -593,16 +604,8 @@ impl BlockStreamMetrics {
                 labels.clone(),
             )
             .expect("failed to create `deployment_head` gauge");
-        let deployment_failed = registry
-            .new_gauge(
-                "deployment_failed",
-                "Boolean gauge to indicate whether the deployment has failed (1 == failed)",
-                labels,
-            )
-            .expect("failed to create `deployment_failed` gauge");
         Self {
             deployment_head,
-            deployment_failed,
             reverted_blocks,
             stopwatch,
         }

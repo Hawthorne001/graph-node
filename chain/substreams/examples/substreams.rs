@@ -52,15 +52,16 @@ async fn main() -> Result<(), Error> {
         "substreams",
         &endpoint,
         token,
+        None,
         false,
         false,
         SubgraphLimit::Unlimited,
         Arc::new(endpoint_metrics),
     ));
 
-    let client = Arc::new(ChainClient::new_firehose(FirehoseEndpoints::from(vec![
-        firehose,
-    ])));
+    let client = Arc::new(ChainClient::new_firehose(FirehoseEndpoints::for_testing(
+        vec![firehose],
+    )));
 
     let mut stream: SubstreamsBlockStream<graph_chain_substreams::Chain> =
         SubstreamsBlockStream::new(
@@ -72,7 +73,7 @@ async fn main() -> Result<(), Error> {
                 schema: None,
                 skip_empty_blocks: false,
             }),
-            package.modules.clone(),
+            package.modules.clone().unwrap_or_default(),
             module_name.to_string(),
             vec![12369621],
             vec![],

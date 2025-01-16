@@ -13,6 +13,7 @@ use graph::components::versions::VERSIONS;
 use graph::data::graphql::{object, IntoValue, ObjectOrInterface, ValueMap};
 use graph::data::subgraph::{status, DeploymentFeatures};
 use graph::data::value::Object;
+use graph::futures03::TryFutureExt;
 use graph::prelude::*;
 use graph_graphql::prelude::{a, ExecutionContext, Resolver};
 
@@ -266,7 +267,7 @@ impl<S: Store> IndexNodeResolver<S> {
 
         let chain = if let Ok(c) = self
             .blockchain_map
-            .get::<graph_chain_ethereum::Chain>(network.clone())
+            .get::<graph_chain_ethereum::Chain>(network.as_str().into())
         {
             c
         } else {
@@ -369,7 +370,7 @@ impl<S: Store> IndexNodeResolver<S> {
         let poi_fut = self
             .store
             .get_proof_of_indexing(&deployment_id, &indexer, block.clone());
-        let poi = match futures::executor::block_on(poi_fut) {
+        let poi = match graph::futures03::executor::block_on(poi_fut) {
             Ok(Some(poi)) => r::Value::String(format!("0x{}", hex::encode(poi))),
             Ok(None) => r::Value::Null,
             Err(e) => {
@@ -590,23 +591,6 @@ impl<S: Store> IndexNodeResolver<S> {
                 )
                 .await?
             }
-            BlockchainKind::Starknet => {
-                let unvalidated_subgraph_manifest =
-                    UnvalidatedSubgraphManifest::<graph_chain_substreams::Chain>::resolve(
-                        deployment_hash.clone(),
-                        raw_yaml,
-                        &self.link_resolver,
-                        &self.logger,
-                        max_spec_version,
-                    )
-                    .await?;
-
-                Self::validate_and_extract_features(
-                    &self.store.subgraph_store(),
-                    unvalidated_subgraph_manifest,
-                )
-                .await?
-            }
         };
 
         Ok(result)
@@ -626,7 +610,24 @@ impl<S: Store> IndexNodeResolver<S> {
 
         let subgraph_store = self.store.subgraph_store();
         let features = match subgraph_store.subgraph_features(&deployment_hash).await? {
-            Some(features) => features,
+            Some(features) => {
+                let mut deployment_features = features.clone();
+                let features = &mut deployment_features.features;
+
+                if deployment_features.has_declared_calls {
+                    features.push("declaredEthCalls".to_string());
+                }
+                if deployment_features.has_aggregations {
+                    features.push("aggregations".to_string());
+                }
+                if !deployment_features.immutable_entities.is_empty() {
+                    features.push("immutableEntities".to_string());
+                }
+                if deployment_features.has_bytes_as_ids {
+                    features.push("bytesAsIds".to_string());
+                }
+                deployment_features
+            }
             None => self.get_features_from_ipfs(&deployment_hash).await?,
         };
 
@@ -658,7 +659,7 @@ impl<S: Store> IndexNodeResolver<S> {
     ) -> Result<Option<BlockPtr>, QueryExecutionError> {
         macro_rules! try_resolve_for_chain {
             ( $typ:path ) => {
-                let blockchain = self.blockchain_map.get::<$typ>(network.to_string()).ok();
+                let blockchain = self.blockchain_map.get::<$typ>(network.as_str().into()).ok();
 
                 if let Some(blockchain) = blockchain {
                     debug!(
@@ -699,7 +700,6 @@ impl<S: Store> IndexNodeResolver<S> {
         try_resolve_for_chain!(graph_chain_arweave::Chain);
         try_resolve_for_chain!(graph_chain_cosmos::Chain);
         try_resolve_for_chain!(graph_chain_near::Chain);
-        try_resolve_for_chain!(graph_chain_starknet::Chain);
 
         // If you're adding support for a new chain and this `match` clause just
         // gave you a compiler error, then this message is for you! You need to
@@ -711,8 +711,7 @@ impl<S: Store> IndexNodeResolver<S> {
             | BlockchainKind::Arweave
             | BlockchainKind::Ethereum
             | BlockchainKind::Cosmos
-            | BlockchainKind::Near
-            | BlockchainKind::Starknet => (),
+            | BlockchainKind::Near => (),
         }
 
         // The given network does not exist.

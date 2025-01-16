@@ -14,19 +14,23 @@ mod ddl_tests;
 #[cfg(test)]
 mod query_tests;
 
+pub(crate) mod dsl;
 pub(crate) mod index;
 mod prune;
 mod rollup;
+pub(crate) mod value;
 
+use diesel::deserialize::FromSql;
 use diesel::pg::Pg;
-use diesel::serialize::Output;
+use diesel::serialize::{Output, ToSql};
 use diesel::sql_types::Text;
-use diesel::types::{FromSql, ToSql};
 use diesel::{connection::SimpleConnection, Connection};
-use diesel::{debug_query, OptionalExtension, PgConnection, QueryResult, RunQueryDsl};
+use diesel::{
+    debug_query, sql_query, OptionalExtension, PgConnection, QueryDsl, QueryResult, RunQueryDsl,
+};
 use graph::blockchain::BlockTime;
 use graph::cheap_clone::CheapClone;
-use graph::components::store::write::RowGroup;
+use graph::components::store::write::{RowGroup, WriteChunk};
 use graph::components::subgraph::PoICausalityRegion;
 use graph::constraint_violation;
 use graph::data::graphql::TypeExt as _;
@@ -38,6 +42,7 @@ use graph::schema::{
     EntityKey, EntityType, Field, FulltextConfig, FulltextDefinition, InputSchema,
 };
 use graph::slog::warn;
+use index::IndexList;
 use inflector::Inflector;
 use itertools::Itertools;
 use lazy_static::lazy_static;
@@ -49,15 +54,19 @@ use std::str::FromStr;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use crate::relational_queries::{FindChangesQuery, FindDerivedQuery, FindPossibleDeletionsQuery};
+use crate::relational::value::{FromOidRow, OidRow};
+use crate::relational_queries::{
+    ConflictingEntitiesData, ConflictingEntitiesQuery, FindChangesQuery, FindDerivedQuery,
+    FindPossibleDeletionsQuery, ReturnedEntityData,
+};
 use crate::{
     primary::{Namespace, Site},
     relational_queries::{
-        ClampRangeQuery, ConflictingEntityQuery, EntityData, EntityDeletion, FilterCollection,
-        FilterQuery, FindManyQuery, FindQuery, InsertQuery, RevertClampQuery, RevertRemoveQuery,
+        ClampRangeQuery, EntityData, EntityDeletion, FilterCollection, FilterQuery, FindManyQuery,
+        InsertQuery, RevertClampQuery, RevertRemoveQuery,
     },
 };
-use graph::components::store::DerivedEntityQuery;
+use graph::components::store::{AttributeNames, DerivedEntityQuery};
 use graph::data::store::{Id, IdList, IdType, BYTES_SCALAR};
 use graph::data::subgraph::schema::POI_TABLE;
 use graph::prelude::{
@@ -168,6 +177,12 @@ impl From<String> for SqlName {
     }
 }
 
+impl From<SqlName> for Word {
+    fn from(name: SqlName) -> Self {
+        Word::from(name.0)
+    }
+}
+
 impl fmt::Display for SqlName {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         self.0.fmt(f)
@@ -180,14 +195,20 @@ impl Borrow<str> for &SqlName {
     }
 }
 
+impl PartialEq<str> for SqlName {
+    fn eq(&self, other: &str) -> bool {
+        self.0 == other
+    }
+}
+
 impl FromSql<Text, Pg> for SqlName {
-    fn from_sql(bytes: Option<&[u8]>) -> diesel::deserialize::Result<Self> {
+    fn from_sql(bytes: diesel::pg::PgValue) -> diesel::deserialize::Result<Self> {
         <String as FromSql<Text, Pg>>::from_sql(bytes).map(|s| SqlName::verbatim(s))
     }
 }
 
 impl ToSql<Text, Pg> for SqlName {
-    fn to_sql<W: std::io::Write>(&self, out: &mut Output<W, Pg>) -> diesel::serialize::Result {
+    fn to_sql<'b>(&'b self, out: &mut Output<'b, '_, Pg>) -> diesel::serialize::Result {
         <String as ToSql<Text, Pg>>::to_sql(&self.0, out)
     }
 }
@@ -357,9 +378,11 @@ impl Layout {
         }
 
         let table_name = SqlName::verbatim(POI_TABLE.to_owned());
+        let nsp = catalog.site.namespace.clone();
         Table {
             object: poi_type.to_owned(),
             qualified_name: SqlName::qualified_name(&catalog.site.namespace, &table_name),
+            nsp,
             name: table_name,
             columns,
             // The position of this table in all the tables for this layout; this
@@ -377,16 +400,17 @@ impl Layout {
     }
 
     pub fn create_relational_schema(
-        conn: &PgConnection,
+        conn: &mut PgConnection,
         site: Arc<Site>,
         schema: &InputSchema,
         entities_with_causality_region: BTreeSet<EntityType>,
+        index_def: Option<IndexList>,
     ) -> Result<Layout, StoreError> {
         let catalog =
             Catalog::for_creation(conn, site.cheap_clone(), entities_with_causality_region)?;
         let layout = Self::new(site, schema, catalog)?;
         let sql = layout
-            .as_ddl()
+            .as_ddl(index_def)
             .map_err(|_| StoreError::Unknown(anyhow!("failed to generate DDL for layout")))?;
         conn.batch_execute(&sql)?;
         Ok(layout)
@@ -411,7 +435,7 @@ impl Layout {
     /// Import the database schema for this layout from its own database
     /// shard (in `self.site.shard`) into the database represented by `conn`
     /// if the schema for this layout does not exist yet
-    pub fn import_schema(&self, conn: &PgConnection) -> Result<(), StoreError> {
+    pub fn import_schema(&self, conn: &mut PgConnection) -> Result<(), StoreError> {
         let make_query = || -> Result<String, fmt::Error> {
             let nsp = self.site.namespace.as_str();
             let srvname = ForeignServer::name(&self.site.shard);
@@ -460,22 +484,30 @@ impl Layout {
 
     pub fn find(
         &self,
-        conn: &PgConnection,
+        conn: &mut PgConnection,
         key: &EntityKey,
         block: BlockNumber,
     ) -> Result<Option<Entity>, StoreError> {
-        let table = self.table_for_entity(&key.entity_type)?;
-        FindQuery::new(table.as_ref(), key, block)
-            .get_result::<EntityData>(conn)
+        let table = self.table_for_entity(&key.entity_type)?.dsl_table();
+        let columns = table.selected_columns::<Entity>(&AttributeNames::All, None)?;
+
+        let query = table
+            .select_cols(&columns)
+            .filter(table.id_eq(&key.entity_id))
+            .filter(table.at_block(block))
+            .filter(table.belongs_to_causality_region(key.causality_region));
+
+        query
+            .get_result::<OidRow>(conn)
             .optional()?
-            .map(|entity_data| entity_data.deserialize_with_layout(self, None))
+            .map(|row| Entity::from_oid_row(row, &self.input_schema, &columns))
             .transpose()
     }
 
     // An optimization when looking up multiple entities, it will generate a single sql query using `UNION ALL`.
     pub fn find_many(
         &self,
-        conn: &PgConnection,
+        conn: &mut PgConnection,
         ids_for_type: &BTreeMap<(EntityType, CausalityRegion), IdList>,
         block: BlockNumber,
     ) -> Result<BTreeMap<EntityKey, Entity>, StoreError> {
@@ -511,12 +543,14 @@ impl Layout {
 
     pub fn find_derived(
         &self,
-        conn: &PgConnection,
+        conn: &mut PgConnection,
         derived_query: &DerivedEntityQuery,
         block: BlockNumber,
         excluded_keys: &Vec<EntityKey>,
     ) -> Result<BTreeMap<EntityKey, Entity>, StoreError> {
         let table = self.table_for_entity(&derived_query.entity_type)?;
+        let ids = excluded_keys.iter().map(|key| &key.entity_id).cloned();
+        let excluded_keys = IdList::try_from_iter(derived_query.entity_type.id_type()?, ids)?;
         let query = FindDerivedQuery::new(table, derived_query, block, excluded_keys);
 
         let mut entities = BTreeMap::new();
@@ -534,7 +568,7 @@ impl Layout {
 
     pub fn find_changes(
         &self,
-        conn: &PgConnection,
+        conn: &mut PgConnection,
         block: BlockNumber,
     ) -> Result<Vec<EntityOperation>, StoreError> {
         let mut tables = Vec::new();
@@ -545,11 +579,9 @@ impl Layout {
         }
 
         let inserts_or_updates =
-            FindChangesQuery::new(&self.catalog.site.namespace, &tables[..], block)
-                .load::<EntityData>(conn)?;
+            FindChangesQuery::new(&tables[..], block).load::<EntityData>(conn)?;
         let deletions =
-            FindPossibleDeletionsQuery::new(&self.catalog.site.namespace, &tables[..], block)
-                .load::<EntityDeletion>(conn)?;
+            FindPossibleDeletionsQuery::new(&tables[..], block).load::<EntityDeletion>(conn)?;
 
         let mut processed_entities = HashSet::new();
         let mut changes = Vec::new();
@@ -584,10 +616,30 @@ impl Layout {
 
     pub fn insert<'a>(
         &'a self,
-        conn: &PgConnection,
+        conn: &mut PgConnection,
         group: &'a RowGroup,
         stopwatch: &StopwatchMetrics,
     ) -> Result<(), StoreError> {
+        fn chunk_details(chunk: &WriteChunk) -> (BlockNumber, String) {
+            let count = chunk.len();
+            let first = chunk.iter().map(|row| row.block).min().unwrap_or(0);
+            let last = chunk.iter().map(|row| row.block).max().unwrap_or(0);
+            let ids = if chunk.len() < 20 {
+                format!(
+                    " with ids [{}]",
+                    chunk.iter().map(|row| row.to_string()).join(", ")
+                )
+            } else {
+                "".to_string()
+            };
+            let details = if first == last {
+                format!("insert {count} rows{ids}")
+            } else {
+                format!("insert {count} rows at blocks [{first}, {last}]{ids}")
+            };
+            (last, details)
+        }
+
         let table = self.table_for_entity(&group.entity_type)?;
         let _section = stopwatch.start_section("insert_modification_insert_query");
 
@@ -597,29 +649,34 @@ impl Layout {
         for chunk in group.write_chunks(chunk_size) {
             // Empty chunks would lead to invalid SQL
             if !chunk.is_empty() {
-                InsertQuery::new(table, &chunk)?.execute(conn)?;
+                InsertQuery::new(table, &chunk)?
+                    .execute(conn)
+                    .map_err(|e| {
+                        let (block, msg) = chunk_details(&chunk);
+                        StoreError::write_failure(e, table.object.as_str(), block, msg)
+                    })?;
             }
         }
         Ok(())
     }
 
-    pub fn conflicting_entity(
+    pub fn conflicting_entities(
         &self,
-        conn: &PgConnection,
-        entity_id: &Id,
-        entities: Vec<EntityType>,
-    ) -> Result<Option<String>, StoreError> {
-        Ok(ConflictingEntityQuery::new(self, entities, entity_id)?
+        conn: &mut PgConnection,
+        entities: &[EntityType],
+        group: &RowGroup,
+    ) -> Result<Option<(String, String)>, StoreError> {
+        Ok(ConflictingEntitiesQuery::new(self, entities, group)?
             .load(conn)?
             .pop()
-            .map(|data| data.entity))
+            .map(|data: ConflictingEntitiesData| (data.entity, data.id)))
     }
 
     /// order is a tuple (attribute, value_type, direction)
     pub fn query<T: crate::relational_queries::FromEntityData>(
         &self,
         logger: &Logger,
-        conn: &PgConnection,
+        conn: &mut PgConnection,
         query: EntityQuery,
     ) -> Result<(Vec<T>, Trace), QueryExecutionError> {
         fn log_query_timing(
@@ -682,7 +739,7 @@ impl Layout {
 
         let start = Instant::now();
         let values = conn
-            .transaction(|| {
+            .transaction(|conn| {
                 if let Some(ref timeout_sql) = *STATEMENT_TIMEOUT {
                     conn.batch_execute(timeout_sql)?;
                 }
@@ -704,7 +761,7 @@ impl Layout {
                     }
                 };
                 match e {
-                    DatabaseError(DatabaseErrorKind::__Unknown, ref info)
+                    DatabaseError(DatabaseErrorKind::Unknown, ref info)
                         if info.message().starts_with("syntax error in tsquery") =>
                     {
                         QueryExecutionError::FulltextQueryInvalidSyntax(info.message().to_string())
@@ -730,7 +787,7 @@ impl Layout {
 
     pub fn update<'a>(
         &'a self,
-        conn: &PgConnection,
+        conn: &mut PgConnection,
         group: &'a RowGroup,
         stopwatch: &StopwatchMetrics,
     ) -> Result<usize, StoreError> {
@@ -775,10 +832,23 @@ impl Layout {
 
     pub fn delete(
         &self,
-        conn: &PgConnection,
+        conn: &mut PgConnection,
         group: &RowGroup,
         stopwatch: &StopwatchMetrics,
     ) -> Result<usize, StoreError> {
+        fn chunk_details(chunk: &IdList) -> String {
+            if chunk.len() < 20 {
+                let ids = chunk
+                    .iter()
+                    .map(|id| id.to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                format!("clamp ids [{ids}]")
+            } else {
+                format!("clamp {} ids", chunk.len())
+            }
+        }
+
         if !group.has_clamps() {
             // Nothing to do
             return Ok(0);
@@ -802,15 +872,24 @@ impl Layout {
                     group.entity_type.id_type()?,
                     chunk.into_iter().map(|id| (*id).to_owned()),
                 )?;
-                count += ClampRangeQuery::new(table, &chunk, block)?.execute(conn)?
+                count += ClampRangeQuery::new(table, &chunk, block)?
+                    .execute(conn)
+                    .map_err(|e| {
+                        StoreError::write_failure(
+                            e,
+                            group.entity_type.as_str(),
+                            block,
+                            chunk_details(&chunk),
+                        )
+                    })?
             }
         }
         Ok(count)
     }
 
-    pub fn truncate_tables(&self, conn: &PgConnection) -> Result<StoreEvent, StoreError> {
+    pub fn truncate_tables(&self, conn: &mut PgConnection) -> Result<StoreEvent, StoreError> {
         for table in self.tables.values() {
-            conn.execute(&format!("TRUNCATE TABLE {}", table.qualified_name))?;
+            sql_query(&format!("TRUNCATE TABLE {}", table.qualified_name)).execute(conn)?;
         }
         Ok(StoreEvent::new(vec![]))
     }
@@ -821,7 +900,7 @@ impl Layout {
     /// remain
     pub fn revert_block(
         &self,
-        conn: &PgConnection,
+        conn: &mut PgConnection,
         block: BlockNumber,
     ) -> Result<(StoreEvent, i32), StoreError> {
         let mut changes: Vec<EntityChange> = Vec::new();
@@ -830,10 +909,10 @@ impl Layout {
         for table in self.tables.values() {
             // Remove all versions whose entire block range lies beyond
             // `block`
-            let removed = RevertRemoveQuery::new(table, block)
-                .get_results(conn)?
+            let removed: HashSet<_> = RevertRemoveQuery::new(table, block)
+                .get_results::<ReturnedEntityData>(conn)?
                 .into_iter()
-                .collect::<HashSet<_>>();
+                .collect();
             // Make the versions current that existed at `block - 1` but that
             // are not current yet. Those are the ones that were updated or
             // deleted at `block`
@@ -878,12 +957,13 @@ impl Layout {
     /// For metadata, reversion always means deletion since the metadata that
     /// is subject to reversion is only ever created but never updated
     pub fn revert_metadata(
-        conn: &PgConnection,
+        logger: &Logger,
+        conn: &mut PgConnection,
         site: &Site,
         block: BlockNumber,
     ) -> Result<(), StoreError> {
         crate::dynds::revert(conn, site, block)?;
-        crate::deployment::revert_subgraph_errors(conn, &site.deployment, block)?;
+        crate::deployment::revert_subgraph_errors(logger, conn, &site.deployment, block)?;
 
         Ok(())
     }
@@ -905,7 +985,7 @@ impl Layout {
     /// `Layout` in case changes were made
     fn refresh(
         self: Arc<Self>,
-        conn: &PgConnection,
+        conn: &mut PgConnection,
         site: Arc<Site>,
     ) -> Result<Arc<Self>, StoreError> {
         let account_like = crate::catalog::account_like(conn, &self.site)?;
@@ -935,7 +1015,7 @@ impl Layout {
 
     pub(crate) fn block_time(
         &self,
-        conn: &PgConnection,
+        conn: &mut PgConnection,
         block: BlockNumber,
     ) -> Result<Option<BlockTime>, StoreError> {
         let block_time_name = self.input_schema.poi_block_time();
@@ -957,6 +1037,20 @@ impl Layout {
             .transpose()?
             .map(|value| BlockTime::since_epoch(value, 0));
         Ok(block_time)
+    }
+
+    /// Find the time of the last rollup for the subgraph. We do this by
+    /// looking for the maximum timestamp in any aggregation table and
+    /// adding a little bit more than the corresponding interval to it. This
+    /// method crucially depends on the fact that we always write the rollup
+    /// for all aggregations, meaning that if some aggregations do not have
+    /// an entry with the maximum timestamp that there was just no data for
+    /// that interval, but we did try to aggregate at that time.
+    pub(crate) fn last_rollup(
+        &self,
+        conn: &mut PgConnection,
+    ) -> Result<Option<BlockTime>, StoreError> {
+        Rollup::last_rollup(&self.rollups, conn)
     }
 
     /// Construct `Rolllup` for each of the aggregation mappings
@@ -1016,7 +1110,7 @@ impl Layout {
     /// numbers and block times which we do not have anywhere in graph-node.
     pub(crate) fn rollup(
         &self,
-        conn: &PgConnection,
+        conn: &mut PgConnection,
         last_rollup: Option<BlockTime>,
         block_times: &[(BlockNumber, BlockTime)],
     ) -> Result<(), StoreError> {
@@ -1109,6 +1203,7 @@ pub enum ColumnType {
     Bytes,
     Int,
     Int8,
+    Timestamp,
     String,
     TSVector(FulltextConfig),
     Enum(EnumType),
@@ -1120,6 +1215,23 @@ impl From<IdType> for ColumnType {
             IdType::Bytes => ColumnType::Bytes,
             IdType::String => ColumnType::String,
             IdType::Int8 => ColumnType::Int8,
+        }
+    }
+}
+
+impl std::fmt::Display for ColumnType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ColumnType::Boolean => write!(f, "Boolean"),
+            ColumnType::BigDecimal => write!(f, "BigDecimal"),
+            ColumnType::BigInt => write!(f, "BigInt"),
+            ColumnType::Bytes => write!(f, "Bytes"),
+            ColumnType::Int => write!(f, "Int"),
+            ColumnType::Int8 => write!(f, "Int8"),
+            ColumnType::Timestamp => write!(f, "Timestamp"),
+            ColumnType::String => write!(f, "String"),
+            ColumnType::TSVector(_) => write!(f, "TSVector"),
+            ColumnType::Enum(enum_type) => write!(f, "Enum({})", enum_type.name),
         }
     }
 }
@@ -1172,6 +1284,7 @@ impl ColumnType {
             ValueType::Bytes => Ok(ColumnType::Bytes),
             ValueType::Int => Ok(ColumnType::Int),
             ValueType::Int8 => Ok(ColumnType::Int8),
+            ValueType::Timestamp => Ok(ColumnType::Timestamp),
             ValueType::String => Ok(ColumnType::String),
         }
     }
@@ -1184,6 +1297,7 @@ impl ColumnType {
             ColumnType::Bytes => "bytea",
             ColumnType::Int => "int4",
             ColumnType::Int8 => "int8",
+            ColumnType::Timestamp => "timestamptz",
             ColumnType::String => "text",
             ColumnType::TSVector(_) => "tsvector",
             ColumnType::Enum(enum_type) => enum_type.name.as_str(),
@@ -1273,6 +1387,21 @@ impl Column {
             is_reference,
             use_prefix_comparison,
         })
+    }
+
+    pub fn pseudo_column(name: &str, column_type: ColumnType) -> Column {
+        let field_type = q::Type::NamedType(column_type.to_string());
+        let name = SqlName::verbatim(name.to_string());
+        let field = Word::from(name.as_str());
+        Column {
+            name,
+            field,
+            field_type,
+            column_type,
+            fulltext_fields: None,
+            is_reference: false,
+            use_prefix_comparison: false,
+        }
     }
 
     fn new_fulltext(def: &FulltextDefinition) -> Result<Column, StoreError> {
@@ -1366,6 +1495,10 @@ pub struct Table {
     /// aggregations, this is the object type for a specific interval, like
     /// `Stats_hour`, not the overall aggregation type `Stats`.
     pub object: EntityType,
+
+    /// The namespace in which the table lives
+    nsp: Namespace,
+
     /// The name of the database table for this type ('thing'), snakecased
     /// version of `object`
     pub name: SqlName,
@@ -1413,17 +1546,18 @@ impl Table {
         let table_name = SqlName::from(defn.as_str());
         let columns = object_type
             .fields
-            .into_iter()
+            .iter()
             .filter(|field| !field.is_derived())
             .map(|field| Column::new(schema, &table_name, field, catalog))
             .chain(fulltexts.iter().map(Column::new_fulltext))
             .collect::<Result<Vec<Column>, StoreError>>()?;
         let qualified_name = SqlName::qualified_name(&catalog.site.namespace, &table_name);
         let immutable = defn.is_immutable();
-
+        let nsp = catalog.site.namespace.clone();
         let table = Table {
             object: defn.cheap_clone(),
             name: table_name,
+            nsp,
             qualified_name,
             // Default `is_account_like` to `false`; the caller should call
             // `refresh` after constructing the layout, but that requires a
@@ -1442,6 +1576,7 @@ impl Table {
     pub fn new_like(&self, namespace: &Namespace, name: &SqlName) -> Arc<Table> {
         let other = Table {
             object: self.object.clone(),
+            nsp: self.nsp.clone(),
             name: name.clone(),
             qualified_name: SqlName::qualified_name(namespace, name),
             columns: self.columns.clone(),
@@ -1502,10 +1637,10 @@ impl Table {
             .expect("every table has a primary key")
     }
 
-    pub(crate) fn analyze(&self, conn: &PgConnection) -> Result<(), StoreError> {
+    pub(crate) fn analyze(&self, conn: &mut PgConnection) -> Result<(), StoreError> {
         let table_name = &self.qualified_name;
         let sql = format!("analyze (skip_locked) {table_name}");
-        conn.execute(&sql)?;
+        sql_query(&sql).execute(conn)?;
         Ok(())
     }
 
@@ -1515,6 +1650,10 @@ impl Table {
         } else {
             &crate::block_range::BLOCK_RANGE_COLUMN_SQL
         }
+    }
+
+    pub fn dsl_table(&self) -> dsl::Table<'_> {
+        dsl::Table::new(self)
     }
 }
 
@@ -1534,6 +1673,7 @@ pub struct LayoutCache {
     /// Use this so that we only refresh one layout at any given time to
     /// avoid refreshing the same layout multiple times
     refresh: Mutex<()>,
+    last_sweep: Mutex<Instant>,
 }
 
 impl LayoutCache {
@@ -1542,10 +1682,11 @@ impl LayoutCache {
             entries: Mutex::new(HashMap::new()),
             ttl,
             refresh: Mutex::new(()),
+            last_sweep: Mutex::new(Instant::now()),
         }
     }
 
-    fn load(conn: &PgConnection, site: Arc<Site>) -> Result<Arc<Layout>, StoreError> {
+    fn load(conn: &mut PgConnection, site: Arc<Site>) -> Result<Arc<Layout>, StoreError> {
         let (subgraph_schema, use_bytea_prefix) = deployment::schema(conn, site.as_ref())?;
         let has_causality_region =
             deployment::entities_with_causality_region(conn, site.id, &subgraph_schema)?;
@@ -1555,7 +1696,7 @@ impl LayoutCache {
     }
 
     fn cache(&self, layout: Arc<Layout>) {
-        if layout.is_cacheable() {
+        if self.ttl > Duration::ZERO && layout.is_cacheable() {
             let deployment = layout.site.deployment.clone();
             let entry = CacheEntry {
                 expires: Instant::now() + self.ttl,
@@ -1581,7 +1722,7 @@ impl LayoutCache {
     pub fn get(
         &self,
         logger: &Logger,
-        conn: &PgConnection,
+        conn: &mut PgConnection,
         site: Arc<Site>,
     ) -> Result<Arc<Layout>, StoreError> {
         let now = Instant::now();
@@ -1589,11 +1730,11 @@ impl LayoutCache {
             let lock = self.entries.lock().unwrap();
             lock.get(&site.deployment).cloned()
         };
-        match entry {
+        let layout = match entry {
             Some(CacheEntry { value, expires }) => {
                 if now <= expires {
                     // Entry is not expired; use it
-                    Ok(value)
+                    value
                 } else {
                     // Only do a cache refresh once; we don't want to have
                     // multiple threads refreshing the same layout
@@ -1601,32 +1742,45 @@ impl LayoutCache {
                     // layout globally
                     let refresh = self.refresh.try_lock();
                     if refresh.is_err() {
-                        return Ok(value);
-                    }
-                    match value.cheap_clone().refresh(conn, site) {
-                        Err(e) => {
-                            warn!(
-                                logger,
-                                "failed to refresh statistics. Continuing with old statistics";
-                                "deployment" => &value.site.deployment,
-                                "error" => e.to_string()
-                            );
-                            // Update the timestamp so we don't retry
-                            // refreshing too often
-                            self.cache(value.cheap_clone());
-                            Ok(value)
-                        }
-                        Ok(layout) => {
-                            self.cache(layout.cheap_clone());
-                            Ok(layout)
-                        }
+                        value
+                    } else {
+                        self.refresh(logger, conn, site, value)
                     }
                 }
             }
             None => {
                 let layout = Self::load(conn, site)?;
                 self.cache(layout.cheap_clone());
-                Ok(layout)
+                layout
+            }
+        };
+        self.sweep(now);
+        Ok(layout)
+    }
+
+    fn refresh(
+        &self,
+        logger: &Logger,
+        conn: &mut PgConnection,
+        site: Arc<Site>,
+        value: Arc<Layout>,
+    ) -> Arc<Layout> {
+        match value.cheap_clone().refresh(conn, site) {
+            Err(e) => {
+                warn!(
+                    logger,
+                    "failed to refresh statistics. Continuing with old statistics";
+                    "deployment" => &value.site.deployment,
+                    "error" => e.to_string()
+                );
+                // Update the timestamp so we don't retry
+                // refreshing too often
+                self.cache(value.cheap_clone());
+                value
+            }
+            Ok(layout) => {
+                self.cache(layout.cheap_clone());
+                layout
             }
         }
     }
@@ -1643,5 +1797,18 @@ impl LayoutCache {
     #[cfg(debug_assertions)]
     pub(crate) fn clear(&self) {
         self.entries.lock().unwrap().clear()
+    }
+
+    /// Periodically sweep the cache to remove expired entries; an entry is
+    /// expired if it was last updated more than 2*self.ttl ago
+    fn sweep(&self, now: Instant) {
+        if now - *self.last_sweep.lock().unwrap() < ENV_VARS.store.schema_cache_ttl {
+            return;
+        }
+        let mut entries = self.entries.lock().unwrap();
+        // We allow entries to stick around for 2*ttl; if an entry was used
+        // in that time, it will get refreshed and have its expiry updated
+        entries.retain(|_, entry| entry.expires + self.ttl > now);
+        *self.last_sweep.lock().unwrap() = now;
     }
 }

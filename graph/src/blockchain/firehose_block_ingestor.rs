@@ -15,7 +15,8 @@ use prost_types::Any;
 use slog::{o, trace};
 use tonic::Streaming;
 
-use super::{client::ChainClient, BlockIngestor, Blockchain};
+use super::{client::ChainClient, BlockIngestor, Blockchain, BlockchainKind};
+use crate::components::network_provider::ChainName;
 
 const TRANSFORM_ETHEREUM_HEADER_ONLY: &str =
     "type.googleapis.com/sf.ethereum.transform.v1.HeaderOnly";
@@ -43,7 +44,7 @@ where
     client: Arc<ChainClient<C>>,
     logger: Logger,
     default_transforms: Vec<Transforms>,
-    chain_name: String,
+    chain_name: ChainName,
 
     phantom: PhantomData<M>,
 }
@@ -56,7 +57,7 @@ where
         chain_store: Arc<dyn ChainStore>,
         client: Arc<ChainClient<C>>,
         logger: Logger,
-        chain_name: String,
+        chain_name: ChainName,
     ) -> FirehoseBlockIngestor<M, C> {
         FirehoseBlockIngestor {
             chain_store,
@@ -104,7 +105,7 @@ where
         while let Some(message) = stream.next().await {
             match message {
                 Ok(v) => {
-                    let step = ForkStep::from_i32(v.step)
+                    let step = ForkStep::try_from(v.step)
                         .expect("Fork step should always match to known value");
 
                     let result = match step {
@@ -169,7 +170,7 @@ where
             ExponentialBackoff::new(Duration::from_millis(250), Duration::from_secs(30));
 
         loop {
-            let endpoint = match self.client.firehose_endpoint() {
+            let endpoint = match self.client.firehose_endpoint().await {
                 Ok(endpoint) => endpoint,
                 Err(err) => {
                     error!(
@@ -182,7 +183,7 @@ where
             };
 
             let logger = self.logger.new(
-                o!("provider" => endpoint.provider.to_string(), "network_name"=> self.network_name()),
+                o!("provider" => endpoint.provider.to_string(), "network_name"=> self.network_name().to_string()),
             );
 
             info!(
@@ -192,14 +193,17 @@ where
 
             let result = endpoint
                 .clone()
-                .stream_blocks(firehose::Request {
-                    // Starts at current HEAD block of the chain (viewed from Firehose side)
-                    start_block_num: -1,
-                    cursor: latest_cursor.clone(),
-                    final_blocks_only: false,
-                    transforms: self.default_transforms.iter().map(|t| t.into()).collect(),
-                    ..Default::default()
-                })
+                .stream_blocks(
+                    firehose::Request {
+                        // Starts at current HEAD block of the chain (viewed from Firehose side)
+                        start_block_num: -1,
+                        cursor: latest_cursor.clone(),
+                        final_blocks_only: false,
+                        transforms: self.default_transforms.iter().map(|t| t.into()).collect(),
+                        ..Default::default()
+                    },
+                    &firehose::ConnectionHeaders::new(),
+                )
                 .await;
 
             match result {
@@ -207,7 +211,11 @@ where
                     info!(logger, "Blockstream connected, consuming blocks");
 
                     // Consume the stream of blocks until an error is hit
-                    latest_cursor = self.process_blocks(latest_cursor, stream).await
+                    let cursor = self.process_blocks(latest_cursor.clone(), stream).await;
+                    if cursor != latest_cursor {
+                        backoff.reset();
+                        latest_cursor = cursor;
+                    }
                 }
                 Err(e) => {
                     error!(logger, "Unable to connect to endpoint: {:#}", e);
@@ -219,7 +227,11 @@ where
         }
     }
 
-    fn network_name(&self) -> String {
+    fn network_name(&self) -> ChainName {
         self.chain_name.clone()
+    }
+
+    fn kind(&self) -> BlockchainKind {
+        C::KIND
     }
 }

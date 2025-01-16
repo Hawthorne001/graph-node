@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::time::Instant;
 
 use crate::deployment_store::{DeploymentStore, ReplicaId};
@@ -43,13 +44,13 @@ impl QueryStoreTrait for QueryStore {
     ) -> Result<(Vec<QueryObject>, Trace), graph::prelude::QueryExecutionError> {
         assert_eq!(&self.site.deployment, &query.subgraph_id);
         let start = Instant::now();
-        let conn = self
+        let mut conn = self
             .store
             .get_replica_conn(self.replica_id)
             .map_err(|e| QueryExecutionError::StoreError(e.into()))?;
         let wait = start.elapsed();
         self.store
-            .execute_query(&conn, self.site.clone(), query)
+            .execute_query(&mut conn, self.site.clone(), query)
             .map(|(entities, mut trace)| {
                 trace.conn_wait(wait);
                 (entities, trace)
@@ -104,17 +105,15 @@ impl QueryStoreTrait for QueryStore {
             .map(|opt| opt.map(|(number, _, _)| number))
     }
 
-    fn wait_stats(&self) -> Result<PoolWaitStats, StoreError> {
-        self.store.wait_stats(self.replica_id)
+    async fn block_numbers(
+        &self,
+        block_hashes: Vec<BlockHash>,
+    ) -> Result<HashMap<BlockHash, BlockNumber>, StoreError> {
+        self.chain_store.block_numbers(block_hashes).await
     }
 
-    async fn has_deterministic_errors(&self, block: BlockNumber) -> Result<bool, StoreError> {
-        let id = self.site.deployment.clone();
-        self.store
-            .with_conn(move |conn, _| {
-                crate::deployment::has_deterministic_errors(conn, &id, block).map_err(|e| e.into())
-            })
-            .await
+    fn wait_stats(&self) -> Result<PoolWaitStats, StoreError> {
+        self.store.wait_stats(self.replica_id)
     }
 
     async fn deployment_state(&self) -> Result<DeploymentState, QueryExecutionError> {
@@ -125,13 +124,13 @@ impl QueryStoreTrait for QueryStore {
     }
 
     fn api_schema(&self) -> Result<Arc<ApiSchema>, QueryExecutionError> {
-        let info = self.store.subgraph_info(&self.site)?;
+        let info = self.store.subgraph_info(self.site.cheap_clone())?;
         Ok(info.api.get(&self.api_version).unwrap().clone())
     }
 
     fn input_schema(&self) -> Result<InputSchema, QueryExecutionError> {
-        let info = self.store.subgraph_info(&self.site)?;
-        Ok(info.input)
+        let layout = self.store.find_layout(self.site.cheap_clone())?;
+        Ok(layout.input_schema.cheap_clone())
     }
 
     fn network_name(&self) -> &str {

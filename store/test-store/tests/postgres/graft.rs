@@ -1,5 +1,5 @@
 use graph::blockchain::block_stream::FirehoseCursor;
-use graph::schema::{EntityType, InputSchema};
+use graph::schema::InputSchema;
 use graph_store_postgres::command_support::OnSync;
 use lazy_static::lazy_static;
 use std::{marker::PhantomData, str::FromStr};
@@ -94,7 +94,6 @@ lazy_static! {
     .enumerate()
     .map(|(idx, hash)| BlockPtr::try_from((*hash, idx as i64)).unwrap())
     .collect();
-    static ref USER_TYPE: EntityType = TEST_SUBGRAPH_SCHEMA.entity_type(USER).unwrap();
 }
 
 /// Test harness for running database integration tests.
@@ -320,10 +319,13 @@ async fn check_graft(
     let mut shaq = entities.first().unwrap().clone();
     assert_eq!(Some(&Value::from("queensha@email.com")), shaq.get("email"));
 
+    let schema = store.input_schema(&deployment.hash)?;
+    let user_type = schema.entity_type("User").unwrap();
+
     // Make our own entries for block 2
     shaq.set("email", "shaq@gmail.com").unwrap();
     let op = EntityOperation::Set {
-        key: USER_TYPE.parse_key("3").unwrap(),
+        key: user_type.parse_key("3").unwrap(),
         data: shaq,
     };
     transact_and_wait(&store, &deployment, BLOCKS[2].clone(), vec![op])
@@ -480,9 +482,9 @@ fn on_sync() {
                     .await?;
 
                 writable.start_subgraph_deployment(&LOGGER).await?;
-                writable.deployment_synced()?;
+                writable.deployment_synced(BLOCKS[0].clone())?;
 
-                let primary = primary_connection();
+                let mut primary = primary_connection();
                 let src_site = primary.locate_site(src)?.unwrap();
                 let src_node = primary.assigned_node(&src_site)?;
                 let dst_site = primary.locate_site(dst)?.unwrap();
@@ -531,13 +533,13 @@ fn on_sync() {
             // Perform the copy
             writable.start_subgraph_deployment(&LOGGER).await?;
 
-            let primary = primary_connection();
+            let mut primary = primary_connection();
             let src_site = primary.locate_site(src.clone())?.unwrap();
             primary.unassign_subgraph(&src_site)?;
             store.activate(&dst)?;
             store.remove_deployment(src.id.into())?;
 
-            let res = writable.deployment_synced();
+            let res = writable.deployment_synced(BLOCKS[2].clone());
             assert!(res.is_ok());
         }
         Ok(())

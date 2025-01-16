@@ -186,6 +186,13 @@ impl<C: Blockchain> DataSource<C> {
         }
     }
 
+    pub fn has_declared_calls(&self) -> bool {
+        match self {
+            Self::Onchain(ds) => ds.has_declared_calls(),
+            Self::Offchain(_) => false,
+        }
+    }
+
     pub fn match_and_decode(
         &self,
         trigger: &TriggerData<C>,
@@ -236,9 +243,9 @@ impl<C: Blockchain> DataSource<C> {
         }
     }
 
-    pub fn validate(&self) -> Vec<Error> {
+    pub fn validate(&self, spec_version: &semver::Version) -> Vec<Error> {
         match self {
-            Self::Onchain(ds) => ds.validate(),
+            Self::Onchain(ds) => ds.validate(spec_version),
             Self::Offchain(_) => vec![],
         }
     }
@@ -490,6 +497,13 @@ impl<C: Blockchain> MappingTrigger<C> {
         match self {
             Self::Onchain(trigger) => Some(trigger.error_context()),
             Self::Offchain(_) => None, // TODO: Add error context for offchain triggers
+        }
+    }
+
+    pub fn as_onchain(&self) -> Option<&C::MappingTrigger> {
+        match self {
+            Self::Onchain(trigger) => Some(trigger),
+            Self::Offchain(_) => None,
         }
     }
 }

@@ -15,6 +15,10 @@ pub struct EnvVarsStore {
     /// Set by the environment variable `GRAPH_QUERY_STATS_REFRESH_INTERVAL`
     /// (expressed in seconds). The default value is 300 seconds.
     pub query_stats_refresh_interval: Duration,
+    /// How long entries in the schema cache are kept before they are
+    /// evicted in seconds. Defaults to
+    /// `2*GRAPH_QUERY_STATS_REFRESH_INTERVAL`
+    pub schema_cache_ttl: Duration,
     /// This can be used to effectively disable the query semaphore by setting
     /// it to a high number, but there's typically no need to configure this.
     ///
@@ -116,6 +120,14 @@ pub struct EnvVarsStore {
     pub use_brin_for_all_query_types: bool,
     /// Temporary env var to disable certain lookups in the chain store
     pub disable_block_cache_for_lookup: bool,
+    /// Temporary env var to fall back to the old broken way of determining
+    /// the time of the last rollup from the POI table instead of the new
+    /// way that fixes
+    /// https://github.com/graphprotocol/graph-node/issues/5530 Remove this
+    /// and all code that is dead as a consequence once this has been vetted
+    /// sufficiently, probably after 2024-12-01
+    /// Defaults to `false`, i.e. using the new fixed behavior
+    pub last_rollup_from_poi: bool,
 }
 
 // This does not print any values avoid accidentally leaking any sensitive env vars
@@ -132,6 +144,10 @@ impl From<InnerStore> for EnvVarsStore {
             query_stats_refresh_interval: Duration::from_secs(
                 x.query_stats_refresh_interval_in_secs,
             ),
+            schema_cache_ttl: x
+                .schema_cache_ttl
+                .map(Duration::from_secs)
+                .unwrap_or_else(|| Duration::from_secs(2 * x.query_stats_refresh_interval_in_secs)),
             extra_query_permits: x.extra_query_permits,
             large_notification_cleanup_interval: Duration::from_secs(
                 x.large_notification_cleanup_interval_in_secs,
@@ -160,6 +176,7 @@ impl From<InnerStore> for EnvVarsStore {
             create_gin_indexes: x.create_gin_indexes,
             use_brin_for_all_query_types: x.use_brin_for_all_query_types,
             disable_block_cache_for_lookup: x.disable_block_cache_for_lookup,
+            last_rollup_from_poi: x.last_rollup_from_poi,
         }
     }
 }
@@ -170,6 +187,8 @@ pub struct InnerStore {
     chain_head_watcher_timeout_in_secs: u64,
     #[envconfig(from = "GRAPH_QUERY_STATS_REFRESH_INTERVAL", default = "300")]
     query_stats_refresh_interval_in_secs: u64,
+    #[envconfig(from = "GRAPH_SCHEMA_CACHE_TTL")]
+    schema_cache_ttl: Option<u64>,
     #[envconfig(from = "GRAPH_EXTRA_QUERY_PERMITS", default = "0")]
     extra_query_permits: usize,
     #[envconfig(from = "LARGE_NOTIFICATION_CLEANUP_INTERVAL", default = "300")]
@@ -219,6 +238,8 @@ pub struct InnerStore {
     use_brin_for_all_query_types: bool,
     #[envconfig(from = "GRAPH_STORE_DISABLE_BLOCK_CACHE_FOR_LOOKUP", default = "false")]
     disable_block_cache_for_lookup: bool,
+    #[envconfig(from = "GRAPH_STORE_LAST_ROLLUP_FROM_POI", default = "false")]
+    last_rollup_from_poi: bool,
 }
 
 #[derive(Clone, Copy, Debug)]

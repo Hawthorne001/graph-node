@@ -99,14 +99,14 @@ impl blockchain::DataSource<Chain> for DataSource {
     }
 
     fn is_duplicate_of(&self, _other: &Self) -> bool {
-        todo!()
+        self == _other
     }
 
     fn as_stored_dynamic_data_source(&self) -> graph::components::store::StoredDynamicDataSource {
         unimplemented!("{}", DYNAMIC_DATA_SOURCE_ERROR)
     }
 
-    fn validate(&self) -> Vec<Error> {
+    fn validate(&self, _: &semver::Version) -> Vec<Error> {
         let mut errs = vec![];
 
         if &self.kind != SUBSTREAMS_KIND {
@@ -224,6 +224,9 @@ impl blockchain::UnresolvedDataSource<Chain> for UnresolvedDataSource {
             }
         };
 
+        let initial_block =
+            initial_block.map(|x| x.max(self.source.start_block.unwrap_or_default() as u64));
+
         let initial_block: Option<i32> = initial_block
             .map_or(Ok(None), |x: u64| TryInto::<i32>::try_into(x).map(Some))
             .map_err(anyhow::Error::from)?;
@@ -327,11 +330,14 @@ mod test {
     use graph::{
         blockchain::{DataSource as _, UnresolvedDataSource as _},
         components::link_resolver::LinkResolver,
+        data::subgraph::LATEST_VERSION,
         prelude::{async_trait, serde_yaml, JsonValueStream, Link},
         slog::{o, Discard, Logger},
-        substreams::module::{Kind, KindMap, KindStore},
         substreams::{
-            module::input::{Input, Params},
+            module::{
+                input::{Input, Params},
+                Kind, KindMap, KindStore,
+            },
             Module, Modules, Package,
         },
     };
@@ -355,6 +361,34 @@ mod test {
                     params: None,
                 },
                 start_block: None,
+            },
+            mapping: UnresolvedMapping {
+                api_version: "0.0.7".into(),
+                kind: "substreams/graph-entities".into(),
+                handler: None,
+                file: None,
+            },
+        };
+        assert_eq!(ds, expected);
+    }
+
+    #[test]
+    fn parse_data_source_with_startblock() {
+        let ds: UnresolvedDataSource =
+            serde_yaml::from_str(TEMPLATE_DATA_SOURCE_WITH_START_BLOCK).unwrap();
+        let expected = UnresolvedDataSource {
+            kind: SUBSTREAMS_KIND.into(),
+            network: Some("mainnet".into()),
+            name: "Uniswap".into(),
+            source: crate::UnresolvedSource {
+                package: crate::UnresolvedPackage {
+                    module_name: "output".into(),
+                    file: Link {
+                        link: "/ipfs/QmbHnhUFZa6qqqRyubUYhXntox1TCBxqryaBM1iNGqVJzT".into(),
+                    },
+                    params: None,
+                },
+                start_block: Some(567),
             },
             mapping: UnresolvedMapping {
                 api_version: "0.0.7".into(),
@@ -459,15 +493,19 @@ mod test {
     #[test]
     fn data_source_validation() {
         let mut ds = gen_data_source();
-        assert_eq!(true, ds.validate().is_empty());
+        assert_eq!(true, ds.validate(LATEST_VERSION).is_empty());
 
         ds.network = None;
-        assert_eq!(true, ds.validate().is_empty());
+        assert_eq!(true, ds.validate(LATEST_VERSION).is_empty());
 
         ds.kind = "asdasd".into();
         ds.name = "".into();
         ds.mapping.kind = "asdasd".into();
-        let errs: Vec<String> = ds.validate().into_iter().map(|e| e.to_string()).collect();
+        let errs: Vec<String> = ds
+            .validate(LATEST_VERSION)
+            .into_iter()
+            .map(|e| e.to_string())
+            .collect();
         assert_eq!(
             errs,
             vec![
@@ -523,6 +561,7 @@ mod test {
                         kind: Some(Kind::KindMap(KindMap {
                             output_type: "proto".into(),
                         })),
+                        block_filter: None,
                         inputs: vec![],
                         output: None,
                     },
@@ -535,6 +574,7 @@ mod test {
                             update_policy: 1,
                             value_type: "proto1".into(),
                         })),
+                        block_filter: None,
                         inputs: vec![],
                         output: None,
                     },
@@ -546,6 +586,7 @@ mod test {
                         kind: Some(Kind::KindMap(KindMap {
                             output_type: "proto2".into(),
                         })),
+                        block_filter: None,
                         inputs: vec![],
                         output: None,
                     },
@@ -584,6 +625,22 @@ mod test {
         name: Uniswap
         network: mainnet
         source:
+          package:
+            moduleName: output
+            file:
+              /: /ipfs/QmbHnhUFZa6qqqRyubUYhXntox1TCBxqryaBM1iNGqVJzT
+              # This IPFs path would be generated from a local path at deploy time
+        mapping:
+          kind: substreams/graph-entities
+          apiVersion: 0.0.7
+    "#;
+
+    const TEMPLATE_DATA_SOURCE_WITH_START_BLOCK: &str = r#"
+        kind: substreams
+        name: Uniswap
+        network: mainnet
+        source:
+          startBlock: 567
           package:
             moduleName: output
             file:

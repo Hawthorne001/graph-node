@@ -1,26 +1,27 @@
 use anyhow::anyhow;
-use chrono::{DateTime, Utc};
+use diesel::deserialize::FromSql;
 use diesel::pg::Pg;
-use diesel::serialize::Output;
+use diesel::serialize::{Output, ToSql};
 use diesel::sql_types::Timestamptz;
 use diesel::sql_types::{Bytea, Nullable, Text};
-use diesel::types::FromSql;
-use diesel::types::ToSql;
 use diesel_derives::{AsExpression, FromSqlRow};
 use std::convert::TryFrom;
-use std::io::Write;
 use std::time::Duration;
 use std::{fmt, str::FromStr};
 use web3::types::{Block, H256};
 
+use crate::cheap_clone::CheapClone;
+use crate::components::store::BlockNumber;
 use crate::data::graphql::IntoValue;
+use crate::data::store::scalar::Timestamp;
+use crate::derive::CheapClone;
 use crate::object;
 use crate::prelude::{r, BigInt, TryFromValue, Value, ValueMap};
 use crate::util::stable_hash_glue::{impl_stable_hash, AsBytes};
-use crate::{cheap_clone::CheapClone, components::store::BlockNumber};
 
 /// A simple marker for byte arrays that are really block hashes
-#[derive(Clone, Default, PartialEq, Eq, Hash, AsExpression, FromSqlRow)]
+#[derive(Clone, Default, PartialEq, Eq, Hash, FromSqlRow, AsExpression)]
+#[diesel(sql_type = Bytea)]
 pub struct BlockHash(pub Box<[u8]>);
 
 impl_stable_hash!(BlockHash(transparent: AsBytes));
@@ -43,6 +44,12 @@ impl BlockHash {
     }
 }
 
+impl CheapClone for BlockHash {
+    fn cheap_clone(&self) -> Self {
+        Self(self.0.clone())
+    }
+}
+
 impl fmt::Display for BlockHash {
     fn fmt(&self, f: &mut fmt::Formatter) -> Result<(), fmt::Error> {
         write!(f, "0x{}", hex::encode(&self.0))
@@ -60,8 +67,6 @@ impl fmt::LowerHex for BlockHash {
         f.write_str(&hex::encode(&self.0))
     }
 }
-
-impl CheapClone for BlockHash {}
 
 impl From<H256> for BlockHash {
     fn from(hash: H256) -> Self {
@@ -95,7 +100,7 @@ impl FromStr for BlockHash {
 }
 
 impl FromSql<Nullable<Text>, Pg> for BlockHash {
-    fn from_sql(bytes: Option<&[u8]>) -> diesel::deserialize::Result<Self> {
+    fn from_sql(bytes: diesel::pg::PgValue) -> diesel::deserialize::Result<Self> {
         let s = <String as FromSql<Text, Pg>>::from_sql(bytes)?;
         BlockHash::try_from(s.as_str())
             .map_err(|e| format!("invalid block hash `{}`: {}", s, e).into())
@@ -103,7 +108,7 @@ impl FromSql<Nullable<Text>, Pg> for BlockHash {
 }
 
 impl FromSql<Text, Pg> for BlockHash {
-    fn from_sql(bytes: Option<&[u8]>) -> diesel::deserialize::Result<Self> {
+    fn from_sql(bytes: diesel::pg::PgValue) -> diesel::deserialize::Result<Self> {
         let s = <String as FromSql<Text, Pg>>::from_sql(bytes)?;
         BlockHash::try_from(s.as_str())
             .map_err(|e| format!("invalid block hash `{}`: {}", s, e).into())
@@ -111,22 +116,26 @@ impl FromSql<Text, Pg> for BlockHash {
 }
 
 impl FromSql<Bytea, Pg> for BlockHash {
-    fn from_sql(bytes: Option<&[u8]>) -> diesel::deserialize::Result<Self> {
+    fn from_sql(bytes: diesel::pg::PgValue) -> diesel::deserialize::Result<Self> {
         let bytes = <Vec<u8> as FromSql<Bytea, Pg>>::from_sql(bytes)?;
         Ok(BlockHash::from(bytes))
+    }
+}
+
+impl ToSql<Bytea, Pg> for BlockHash {
+    fn to_sql<'b>(&'b self, out: &mut Output<'b, '_, Pg>) -> diesel::serialize::Result {
+        ToSql::<Bytea, Pg>::to_sql(self.0.as_ref(), out)
     }
 }
 
 /// A block hash and block number from a specific Ethereum block.
 ///
 /// Block numbers are signed 32 bit integers
-#[derive(Clone, PartialEq, Eq, Hash)]
+#[derive(Clone, CheapClone, PartialEq, Eq, Hash)]
 pub struct BlockPtr {
     pub hash: BlockHash,
     pub number: BlockNumber,
 }
-
-impl CheapClone for BlockPtr {}
 
 impl_stable_hash!(BlockPtr { hash, number });
 
@@ -213,6 +222,16 @@ impl From<(H256, i32)> for BlockPtr {
 
 impl From<(Vec<u8>, u64)> for BlockPtr {
     fn from((bytes, number): (Vec<u8>, u64)) -> Self {
+        let number = i32::try_from(number).unwrap();
+        BlockPtr {
+            hash: BlockHash::from(bytes),
+            number,
+        }
+    }
+}
+
+impl From<(Vec<u8>, i64)> for BlockPtr {
+    fn from((bytes, number): (Vec<u8>, i64)) -> Self {
         let number = i32::try_from(number).unwrap();
         BlockPtr {
             hash: BlockHash::from(bytes),
@@ -314,6 +333,21 @@ pub struct ChainIdentifier {
     pub genesis_block_hash: BlockHash,
 }
 
+impl ChainIdentifier {
+    pub fn is_default(&self) -> bool {
+        ChainIdentifier::default().eq(self)
+    }
+}
+
+impl Default for ChainIdentifier {
+    fn default() -> Self {
+        Self {
+            net_version: String::default(),
+            genesis_block_hash: BlockHash::from(H256::zero()),
+        }
+    }
+}
+
 impl fmt::Display for ChainIdentifier {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         write!(
@@ -326,23 +360,24 @@ impl fmt::Display for ChainIdentifier {
 
 /// The timestamp associated with a block. This is used whenever a time
 /// needs to be connected to data within the block
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct BlockTime(DateTime<Utc>);
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, FromSqlRow, AsExpression)]
+#[diesel(sql_type = Timestamptz)]
+pub struct BlockTime(Timestamp);
 
 impl BlockTime {
     /// A timestamp from a long long time ago used to indicate that we don't
     /// have a timestamp
-    pub const NONE: Self = Self(DateTime::<Utc>::MIN_UTC);
+    pub const NONE: Self = Self(Timestamp::NONE);
 
-    pub const MAX: Self = Self(DateTime::<Utc>::MAX_UTC);
+    pub const MAX: Self = Self(Timestamp::MAX);
 
-    pub const MIN: Self = Self(DateTime::<Utc>::MIN_UTC);
+    pub const MIN: Self = Self(Timestamp::MIN);
 
     /// Construct a block time that is the given number of seconds and
     /// nanoseconds after the Unix epoch
     pub fn since_epoch(secs: i64, nanos: u32) -> Self {
         Self(
-            DateTime::from_timestamp(secs, nanos)
+            Timestamp::since_epoch(secs, nanos)
                 .ok_or_else(|| anyhow!("invalid block time: {}s {}ns", secs, nanos))
                 .unwrap(),
         )
@@ -357,7 +392,7 @@ impl BlockTime {
     }
 
     pub fn as_secs_since_epoch(&self) -> i64 {
-        self.0.timestamp()
+        self.0.as_secs_since_epoch()
     }
 
     /// Return the number of the last bucket that starts before `self`
@@ -380,7 +415,7 @@ impl From<Duration> for BlockTime {
 
 impl From<BlockTime> for Value {
     fn from(block_time: BlockTime) -> Self {
-        Value::Int8(block_time.as_secs_since_epoch())
+        Value::Timestamp(block_time.0)
     }
 }
 
@@ -396,7 +431,13 @@ impl TryFrom<&Value> for BlockTime {
 }
 
 impl ToSql<Timestamptz, Pg> for BlockTime {
-    fn to_sql<W: Write>(&self, out: &mut Output<W, Pg>) -> diesel::serialize::Result {
-        <DateTime<Utc> as ToSql<Timestamptz, Pg>>::to_sql(&self.0, out)
+    fn to_sql<'b>(&'b self, out: &mut Output<'b, '_, Pg>) -> diesel::serialize::Result {
+        <Timestamp as ToSql<Timestamptz, Pg>>::to_sql(&self.0, out)
+    }
+}
+
+impl FromSql<Timestamptz, Pg> for BlockTime {
+    fn from_sql(bytes: diesel::pg::PgValue) -> diesel::deserialize::Result<Self> {
+        <Timestamp as FromSql<Timestamptz, Pg>>::from_sql(bytes).map(|ts| Self(ts))
     }
 }

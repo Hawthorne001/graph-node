@@ -2,33 +2,25 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::chain::{
-    connect_ethereum_networks, create_ethereum_networks_for_chain, create_firehose_networks,
-    create_ipfs_clients,
-};
 use crate::config::Config;
 use crate::manager::PanicSubscriptionManager;
+use crate::network_setup::Networks;
 use crate::store_builder::StoreBuilder;
 use crate::MetricsContext;
-use ethereum::chain::{EthereumAdapterSelector, EthereumBlockRefetcher, EthereumStreamBuilder};
-use ethereum::{ProviderEthRpcMetrics, RuntimeAdapter as EthereumRuntimeAdapter};
-use graph::anyhow::{bail, format_err};
-use graph::blockchain::client::ChainClient;
-use graph::blockchain::{BlockchainKind, BlockchainMap};
+use graph::anyhow::bail;
 use graph::cheap_clone::CheapClone;
 use graph::components::link_resolver::{ArweaveClient, FileSizeLimit};
-use graph::components::store::{BlockStore as _, DeploymentLocator};
+use graph::components::network_provider::ChainIdentifierStore;
+use graph::components::store::DeploymentLocator;
 use graph::components::subgraph::Settings;
 use graph::endpoint::EndpointMetrics;
 use graph::env::EnvVars;
-use graph::firehose::FirehoseEndpoints;
 use graph::prelude::{
     anyhow, tokio, BlockNumber, DeploymentHash, IpfsResolver, LoggerFactory, NodeId,
     SubgraphAssignmentProvider, SubgraphCountMetric, SubgraphName, SubgraphRegistrar,
     SubgraphStore, SubgraphVersionSwitchingMode, ENV_VARS,
 };
 use graph::slog::{debug, info, Logger};
-use graph_chain_ethereum as ethereum;
 use graph_core::polling_monitor::{arweave_service, ipfs_service};
 use graph_core::{
     SubgraphAssignmentProvider as IpfsSubgraphAssignmentProvider, SubgraphInstanceManager,
@@ -47,7 +39,7 @@ fn locate(store: &dyn SubgraphStore, hash: &str) -> Result<DeploymentLocator, an
 pub async fn run(
     logger: Logger,
     store_builder: StoreBuilder,
-    network_name: String,
+    _network_name: String,
     ipfs_url: Vec<String>,
     arweave_url: String,
     config: Config,
@@ -66,21 +58,21 @@ pub async fn run(
     let logger_factory = LoggerFactory::new(logger.clone(), None, metrics_ctx.registry.clone());
 
     // FIXME: Hard-coded IPFS config, take it from config file instead?
-    let ipfs_clients: Vec<_> = create_ipfs_clients(&logger, &ipfs_url);
-    let ipfs_client = ipfs_clients.first().cloned().expect("Missing IPFS client");
+    let ipfs_client = graph::ipfs::new_ipfs_client(&ipfs_url, &logger).await?;
+
     let ipfs_service = ipfs_service(
-        ipfs_client,
-        env_vars.mappings.max_ipfs_file_bytes as u64,
+        ipfs_client.cheap_clone(),
+        env_vars.mappings.max_ipfs_file_bytes,
         env_vars.mappings.ipfs_timeout,
         env_vars.mappings.ipfs_request_limit,
     );
+
     let arweave_resolver = Arc::new(ArweaveClient::new(
         logger.cheap_clone(),
         arweave_url.parse().expect("invalid arweave url"),
     ));
     let arweave_service = arweave_service(
         arweave_resolver.cheap_clone(),
-        env_vars.mappings.ipfs_timeout,
         env_vars.mappings.ipfs_request_limit,
         match env_vars.mappings.max_ipfs_file_bytes {
             0 => FileSizeLimit::Unlimited,
@@ -96,94 +88,62 @@ pub async fn run(
 
     // Convert the clients into a link resolver. Since we want to get past
     // possible temporary DNS failures, make the resolver retry
-    let link_resolver = Arc::new(IpfsResolver::new(ipfs_clients, env_vars.cheap_clone()));
-
-    let eth_rpc_metrics = Arc::new(ProviderEthRpcMetrics::new(metrics_registry.clone()));
-    let eth_networks = create_ethereum_networks_for_chain(
-        &logger,
-        eth_rpc_metrics,
-        &config,
-        &network_name,
-        endpoint_metrics.cheap_clone(),
-    )
-    .await
-    .expect("Failed to parse Ethereum networks");
-    let firehose_networks_by_kind =
-        create_firehose_networks(logger.clone(), &config, endpoint_metrics);
-    let firehose_networks = firehose_networks_by_kind.get(&BlockchainKind::Ethereum);
-    let firehose_endpoints = firehose_networks
-        .and_then(|v| v.networks.get(&network_name))
-        .map_or_else(FirehoseEndpoints::new, |v| v.clone());
-
-    let eth_adapters = match eth_networks.networks.get(&network_name) {
-        Some(adapters) => adapters.clone(),
-        None => {
-            return Err(format_err!(
-                "No ethereum adapters found, but required in this state of graphman run command"
-            ))
-        }
-    };
-
-    let eth_adapters2 = eth_adapters.clone();
-
-    let (_, ethereum_idents) = connect_ethereum_networks(&logger, eth_networks).await?;
-    // let (near_networks, near_idents) = connect_firehose_networks::<NearFirehoseHeaderOnlyBlock>(
-    //     &logger,
-    //     firehose_networks_by_kind
-    //         .remove(&BlockchainKind::Near)
-    //         .unwrap_or_else(|| FirehoseNetworks::new()),
-    // )
-    // .await;
+    let link_resolver = Arc::new(IpfsResolver::new(ipfs_client, env_vars.cheap_clone()));
 
     let chain_head_update_listener = store_builder.chain_head_update_listener();
-    let network_identifiers = ethereum_idents.into_iter().collect();
-    let network_store = store_builder.network_store(network_identifiers);
+    let network_store = store_builder.network_store(config.chain_ids());
+    let block_store = network_store.block_store();
+
+    let mut provider_checks: Vec<Arc<dyn graph::components::network_provider::ProviderCheck>> =
+        Vec::new();
+
+    if env_vars.genesis_validation_enabled {
+        let store: Arc<dyn ChainIdentifierStore> = network_store.block_store();
+
+        provider_checks.push(Arc::new(
+            graph::components::network_provider::GenesisHashCheck::new(store),
+        ));
+    }
+
+    provider_checks.push(Arc::new(
+        graph::components::network_provider::ExtendedBlocksCheck::new(
+            env_vars
+                .firehose_disable_extended_blocks_for_chains
+                .iter()
+                .map(|x| x.as_str().into()),
+        ),
+    ));
+
+    let networks = Networks::from_config(
+        logger.cheap_clone(),
+        &config,
+        metrics_registry.cheap_clone(),
+        endpoint_metrics,
+        &provider_checks,
+    )
+    .await
+    .expect("unable to parse network configuration");
 
     let subgraph_store = network_store.subgraph_store();
-    let chain_store = network_store
-        .block_store()
-        .chain_store(network_name.as_ref())
-        .unwrap_or_else(|| panic!("No chain store for {}", &network_name));
 
-    let client = Arc::new(ChainClient::new(firehose_endpoints, eth_adapters));
-
-    let chain_config = config.chains.chains.get(&network_name).unwrap();
-    let chain = ethereum::Chain::new(
-        logger_factory.clone(),
-        network_name.clone(),
-        node_id.clone(),
-        metrics_registry.clone(),
-        chain_store.cheap_clone(),
-        chain_store.cheap_clone(),
-        client.clone(),
-        chain_head_update_listener,
-        Arc::new(EthereumStreamBuilder {}),
-        Arc::new(EthereumBlockRefetcher {}),
-        Arc::new(EthereumAdapterSelector::new(
-            logger_factory.clone(),
-            client,
-            metrics_registry.clone(),
-            chain_store.cheap_clone(),
-        )),
-        Arc::new(EthereumRuntimeAdapter {
-            call_cache: chain_store.cheap_clone(),
-            eth_adapters: Arc::new(eth_adapters2),
-            chain_identifier: Arc::new(chain_store.chain_identifier.clone()),
-        }),
-        graph::env::ENV_VARS.reorg_threshold,
-        chain_config.polling_interval,
-        // We assume the tested chain is always ingestible for now
-        true,
+    let blockchain_map = Arc::new(
+        networks
+            .blockchain_map(
+                &env_vars,
+                &node_id,
+                &logger,
+                block_store,
+                &logger_factory,
+                metrics_registry.cheap_clone(),
+                chain_head_update_listener,
+            )
+            .await,
     );
-
-    let mut blockchain_map = BlockchainMap::new();
-    blockchain_map.insert(network_name.clone(), Arc::new(chain));
 
     let static_filters = ENV_VARS.experimental_static_filters;
 
     let sg_metrics = Arc::new(SubgraphCountMetric::new(metrics_registry.clone()));
 
-    let blockchain_map = Arc::new(blockchain_map);
     let subgraph_instance_manager = SubgraphInstanceManager::new(
         &logger_factory,
         env_vars.cheap_clone(),

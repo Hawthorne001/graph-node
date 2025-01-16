@@ -26,7 +26,6 @@ mod dynds;
 mod fork;
 mod functions;
 mod jobs;
-mod jsonb;
 mod notification_listener;
 mod primary;
 pub mod query_store;
@@ -38,6 +37,8 @@ mod store_events;
 mod subgraph_store;
 pub mod transaction_receipt;
 mod writable;
+
+pub mod graphman;
 
 #[cfg(debug_assertions)]
 pub mod layout_for_tests {
