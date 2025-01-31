@@ -1,6 +1,8 @@
 use diesel::{self, PgConnection};
 use graph::blockchain::mock::MockDataSource;
 use graph::blockchain::BlockTime;
+use graph::blockchain::ChainIdentifier;
+use graph::components::store::BlockStore;
 use graph::data::graphql::load_manager::LoadManager;
 use graph::data::query::QueryResults;
 use graph::data::query::QueryTarget;
@@ -13,9 +15,9 @@ use graph::schema::EntityType;
 use graph::schema::InputSchema;
 use graph::semver::Version;
 use graph::{
-    blockchain::block_stream::FirehoseCursor, blockchain::ChainIdentifier,
-    components::store::DeploymentLocator, components::store::StatusStore,
-    components::store::StoredDynamicDataSource, data::subgraph::status, prelude::NodeId,
+    blockchain::block_stream::FirehoseCursor, components::store::DeploymentLocator,
+    components::store::StatusStore, components::store::StoredDynamicDataSource,
+    data::subgraph::status, prelude::NodeId,
 };
 use graph_graphql::prelude::{
     execute_query, Query as PreparedQuery, QueryExecutionOptions, StoreResolver,
@@ -63,7 +65,7 @@ lazy_static! {
     ));
     static ref STORE_POOL_CONFIG: (Arc<Store>, ConnectionPool, Config, Arc<SubscriptionManager>) =
         build_store();
-    pub(crate) static ref PRIMARY_POOL: ConnectionPool = STORE_POOL_CONFIG.1.clone();
+    pub static ref PRIMARY_POOL: ConnectionPool = STORE_POOL_CONFIG.1.clone();
     pub static ref STORE: Arc<Store> = STORE_POOL_CONFIG.0.clone();
     static ref CONFIG: Config = STORE_POOL_CONFIG.2.clone();
     pub static ref SUBSCRIPTION_MANAGER: Arc<SubscriptionManager> = STORE_POOL_CONFIG.3.clone();
@@ -127,7 +129,7 @@ where
 /// Run a test with a connection into the primary database, not a full store
 pub fn run_test_with_conn<F>(test: F)
 where
-    F: FnOnce(&PgConnection),
+    F: FnOnce(&mut PgConnection),
 {
     // Lock regardless of poisoning. This also forces sequential test execution.
     let _lock = match SEQ_LOCK.lock() {
@@ -135,11 +137,11 @@ where
         Err(err) => err.into_inner(),
     };
 
-    let conn = PRIMARY_POOL
+    let mut conn = PRIMARY_POOL
         .get()
         .expect("failed to get connection for primary database");
 
-    test(&conn);
+    test(&mut conn);
 }
 
 pub fn remove_subgraphs() {
@@ -258,7 +260,7 @@ pub fn remove_subgraph(id: &DeploymentHash) {
     let name = SubgraphName::new_unchecked(id.to_string());
     SUBGRAPH_STORE.remove_subgraph(name).unwrap();
     let locs = SUBGRAPH_STORE.locators(id.as_str()).unwrap();
-    let conn = primary_connection();
+    let mut conn = primary_connection();
     for loc in locs {
         let site = conn.locate_site(loc.clone()).unwrap().unwrap();
         conn.unassign_subgraph(&site).unwrap();
@@ -350,7 +352,7 @@ pub async fn transact_entities_and_dynamic_data_sources(
     ops: Vec<EntityOperation>,
     manifest_idx_and_name: Vec<(u32, String)>,
 ) -> Result<(), StoreError> {
-    let store = futures03::executor::block_on(store.cheap_clone().writable(
+    let store = graph::futures03::executor::block_on(store.cheap_clone().writable(
         LOGGER.clone(),
         deployment.id,
         Arc::new(manifest_idx_and_name),
@@ -405,12 +407,12 @@ pub fn insert_ens_name(hash: &str, name: &str) {
     use diesel::prelude::*;
     use graph_store_postgres::command_support::catalog::ens_names;
 
-    let conn = PRIMARY_POOL.get().unwrap();
+    let mut conn = PRIMARY_POOL.get().unwrap();
 
     insert_into(ens_names::table)
         .values((ens_names::hash.eq(hash), ens_names::name.eq(name)))
         .on_conflict_do_nothing()
-        .execute(&conn)
+        .execute(&mut conn)
         .unwrap();
 }
 
@@ -524,7 +526,7 @@ async fn execute_subgraph_query_internal(
         100,
         graphql_metrics(),
     ));
-    let mut result = QueryResults::empty();
+    let mut result = QueryResults::empty(query.root_trace(trace), None);
     let deployment = query.schema.id().clone();
     let store = STORE
         .clone()
@@ -532,7 +534,9 @@ async fn execute_subgraph_query_internal(
         .await
         .unwrap();
     let state = store.deployment_state().await.unwrap();
-    for (bc, (selection_set, error_policy)) in return_err!(query.block_constraint()) {
+    let by_block_constraint =
+        return_err!(StoreResolver::locate_blocks(store.as_ref(), &state, &query).await);
+    for (ptr, (selection_set, error_policy)) in by_block_constraint {
         let logger = logger.clone();
         let resolver = return_err!(
             StoreResolver::at_block(
@@ -540,7 +544,7 @@ async fn execute_subgraph_query_internal(
                 store.clone(),
                 &state,
                 SUBSCRIPTION_MANAGER.clone(),
-                bc,
+                ptr,
                 error_policy,
                 query.schema.id().clone(),
                 graphql_metrics(),
@@ -548,21 +552,20 @@ async fn execute_subgraph_query_internal(
             )
             .await
         );
-        result.append(
-            execute_query(
-                query.clone(),
-                Some(selection_set),
-                None,
-                QueryExecutionOptions {
-                    resolver,
-                    deadline,
-                    max_first: std::u32::MAX,
-                    max_skip: std::u32::MAX,
-                    trace,
-                },
-            )
-            .await,
+        let (res, status) = execute_query(
+            query.clone(),
+            Some(selection_set),
+            None,
+            QueryExecutionOptions {
+                resolver,
+                deadline,
+                max_first: std::u32::MAX,
+                max_skip: std::u32::MAX,
+                trace,
+            },
         )
+        .await;
+        result.append(res, status);
     }
     result
 }
@@ -625,19 +628,30 @@ fn build_store() -> (Arc<Store>, ConnectionPool, Config, Arc<SubscriptionManager
                 genesis_block_hash: GENESIS_PTR.hash.clone(),
             };
 
-            (
-                builder.network_store(
-                    vec![
-                        (NETWORK_NAME.to_string(), ident.clone()),
-                        (FAKE_NETWORK_SHARED.to_string(), ident),
-                    ]
-                    .into_iter()
-                    .collect(),
-                ),
-                primary_pool,
-                config,
-                subscription_manager,
-            )
+            let store = builder.network_store(
+                vec![
+                    (NETWORK_NAME.to_string()),
+                    (FAKE_NETWORK_SHARED.to_string()),
+                ]
+                .into_iter()
+                .collect(),
+            );
+            match store.block_store().chain_store(NETWORK_NAME) {
+                Some(cs) => {
+                    cs.set_chain_identifier(&ChainIdentifier {
+                        net_version: NETWORK_VERSION.to_string(),
+                        genesis_block_hash: GENESIS_PTR.hash.clone(),
+                    })
+                    .expect("unable to set identifier");
+                }
+                None => {
+                    store
+                        .block_store()
+                        .create_chain_store(NETWORK_NAME, ident)
+                        .expect("unable to create test network store");
+                }
+            }
+            (store, primary_pool, config, subscription_manager)
         })
     })
     .join()

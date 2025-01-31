@@ -7,7 +7,7 @@ use graph::components::store::QueryPermit;
 use graph::data::graphql::{object_value, ObjectOrInterface};
 use graph::data::query::Trace;
 use graph::prelude::{
-    async_trait, o, r, s, serde_json, slog, tokio, DeploymentHash, Logger, Query,
+    async_trait, o, q, r, s, serde_json, slog, tokio, DeploymentHash, Logger, Query,
     QueryExecutionError, QueryResult,
 };
 use graph::schema::{ApiSchema, InputSchema};
@@ -114,11 +114,7 @@ fn expected_mock_schema_introspection() -> r::Value {
 /// Execute an introspection query.
 async fn introspection_query(schema: Arc<ApiSchema>, query: &str) -> QueryResult {
     // Create the query
-    let query = Query::new(
-        graphql_parser::parse_query(query).unwrap().into_static(),
-        None,
-        false,
-    );
+    let query = Query::new(q::parse_query(query).unwrap().into_static(), None, false);
 
     // Execute it
     let logger = Logger::root(slog::Discard, o!());
@@ -133,7 +129,8 @@ async fn introspection_query(schema: Arc<ApiSchema>, query: &str) -> QueryResult
     let result =
         match PreparedQuery::new(&logger, schema, None, query, None, 100, graphql_metrics()) {
             Ok(query) => {
-                Ok(Arc::try_unwrap(execute_query(query, None, None, options).await).unwrap())
+                let (res, _) = execute_query(query, None, None, options).await;
+                Ok(Arc::try_unwrap(res).unwrap())
             }
             Err(e) => Err(e),
         };
@@ -146,7 +143,11 @@ fn compare(a: &r::Value, b: &r::Value, path: &mut Vec<String>) -> Option<(r::Val
     }
 
     match a {
-        r::Value::Int(_) | r::Value::Float(_) | r::Value::Boolean(_) | r::Value::Null => {
+        r::Value::Int(_)
+        | r::Value::Float(_)
+        | r::Value::Boolean(_)
+        | r::Value::Null
+        | r::Value::Timestamp(_) => {
             if a != b {
                 different(a, b)
             } else {
@@ -616,7 +617,6 @@ async fn satisfies_graphiql_introspection_query_with_fragments() {
     // needs to be regenerated, uncomment this line, and save the output in
     // mock_introspection.json
     //
-    // println!("{}", graph::prelude::serde_json::to_string(&data).unwrap());
     assert!(same_value(&data, &expected_mock_schema_introspection()));
 }
 

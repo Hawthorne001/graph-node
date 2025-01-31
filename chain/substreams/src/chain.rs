@@ -3,11 +3,12 @@ use crate::{data_source::*, EntityChanges, TriggerData, TriggerFilter, TriggersA
 use anyhow::Error;
 use graph::blockchain::client::ChainClient;
 use graph::blockchain::{
-    BasicBlockchainBuilder, BlockIngestor, BlockTime, EmptyNodeCapabilities, NoopRuntimeAdapter,
+    BasicBlockchainBuilder, BlockIngestor, BlockTime, EmptyNodeCapabilities, NoopDecoderHook,
+    NoopRuntimeAdapter,
 };
+use graph::components::network_provider::ChainName;
 use graph::components::store::DeploymentCursorTracker;
 use graph::env::EnvVars;
-use graph::firehose::FirehoseEndpoints;
 use graph::prelude::{BlockHash, CheapClone, Entity, LoggerFactory, MetricsRegistry};
 use graph::schema::EntityKey;
 use graph::{
@@ -66,6 +67,7 @@ impl blockchain::Block for Block {
 pub struct Chain {
     chain_store: Arc<dyn ChainStore>,
     block_stream_builder: Arc<dyn BlockStreamBuilder<Self>>,
+    chain_id: ChainName,
 
     pub(crate) logger_factory: LoggerFactory,
     pub(crate) client: Arc<ChainClient<Self>>,
@@ -75,17 +77,19 @@ pub struct Chain {
 impl Chain {
     pub fn new(
         logger_factory: LoggerFactory,
-        firehose_endpoints: FirehoseEndpoints,
+        chain_client: Arc<ChainClient<Self>>,
         metrics_registry: Arc<MetricsRegistry>,
         chain_store: Arc<dyn ChainStore>,
         block_stream_builder: Arc<dyn BlockStreamBuilder<Self>>,
+        chain_id: ChainName,
     ) -> Self {
         Self {
             logger_factory,
-            client: Arc::new(ChainClient::new_firehose(firehose_endpoints)),
+            client: chain_client,
             metrics_registry,
             chain_store,
             block_stream_builder,
+            chain_id,
         }
     }
 }
@@ -119,6 +123,8 @@ impl Blockchain for Chain {
     type TriggerFilter = TriggerFilter;
 
     type NodeCapabilities = EmptyNodeCapabilities<Self>;
+
+    type DecoderHook = NoopDecoderHook;
 
     fn triggers_adapter(
         &self,
@@ -178,30 +184,32 @@ impl Blockchain for Chain {
             number,
         })
     }
-    fn runtime_adapter(&self) -> Arc<dyn RuntimeAdapterTrait<Self>> {
-        Arc::new(NoopRuntimeAdapter::default())
+    fn runtime(&self) -> anyhow::Result<(Arc<dyn RuntimeAdapterTrait<Self>>, Self::DecoderHook)> {
+        Ok((Arc::new(NoopRuntimeAdapter::default()), NoopDecoderHook))
     }
 
     fn chain_client(&self) -> Arc<ChainClient<Self>> {
         self.client.clone()
     }
 
-    fn block_ingestor(&self) -> anyhow::Result<Box<dyn BlockIngestor>> {
+    async fn block_ingestor(&self) -> anyhow::Result<Box<dyn BlockIngestor>> {
         Ok(Box::new(SubstreamsBlockIngestor::new(
             self.chain_store.cheap_clone(),
             self.client.cheap_clone(),
-            self.logger_factory.component_logger("", None),
-            "substreams".to_string(),
+            self.logger_factory
+                .component_logger("SubstreamsBlockIngestor", None),
+            self.chain_id.clone(),
             self.metrics_registry.cheap_clone(),
         )))
     }
 }
 
+#[async_trait]
 impl blockchain::BlockchainBuilder<super::Chain> for BasicBlockchainBuilder {
-    fn build(self, _config: &Arc<EnvVars>) -> Chain {
+    async fn build(self, _config: &Arc<EnvVars>) -> Chain {
         let BasicBlockchainBuilder {
             logger_factory,
-            name: _,
+            name,
             chain_store,
             firehose_endpoints,
             metrics_registry,
@@ -213,6 +221,7 @@ impl blockchain::BlockchainBuilder<super::Chain> for BasicBlockchainBuilder {
             logger_factory,
             client: Arc::new(ChainClient::new_firehose(firehose_endpoints)),
             metrics_registry,
+            chain_id: name,
         }
     }
 }

@@ -1,7 +1,7 @@
 use std::{cmp::Ordering, sync::Arc};
 
 use graph::blockchain::{Block, BlockHash, MappingTriggerTrait, TriggerData};
-use graph::cheap_clone::CheapClone;
+use graph::derive::CheapClone;
 use graph::prelude::{BlockNumber, Error};
 use graph::runtime::HostExportError;
 use graph::runtime::{asc_new, gas::GasCounter, AscHeap, AscPtr};
@@ -13,6 +13,7 @@ use crate::data_source::EventOrigin;
 // Logging the block is too verbose, so this strips the block from the trigger for Debug.
 impl std::fmt::Debug for CosmosTrigger {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        #[allow(unused)]
         #[derive(Debug)]
         pub enum MappingTriggerWithoutBlock<'e> {
             Block,
@@ -59,7 +60,7 @@ impl ToAscPtr for CosmosTrigger {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, CheapClone)]
 pub enum CosmosTrigger {
     Block(Arc<codec::Block>),
     Event {
@@ -69,8 +70,6 @@ pub enum CosmosTrigger {
     Transaction(Arc<codec::TransactionData>),
     Message(Arc<codec::MessageData>),
 }
-
-impl CheapClone for CosmosTrigger {}
 
 impl PartialEq for CosmosTrigger {
     fn eq(&self, other: &Self) -> bool {

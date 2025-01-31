@@ -8,7 +8,6 @@ use std::time::{Duration, Instant};
 
 use anyhow::Error;
 use async_stream::stream;
-use futures::{Stream, StreamExt};
 use graph::blockchain::block_stream::{
     BlockRefetcher, BlockStream, BlockStreamBuilder, BlockStreamError, BlockStreamEvent,
     BlockWithTriggers, FirehoseCursor,
@@ -20,7 +19,8 @@ use graph::blockchain::{
 use graph::cheap_clone::CheapClone;
 use graph::components::link_resolver::{ArweaveClient, ArweaveResolver, FileSizeLimit};
 use graph::components::metrics::MetricsRegistry;
-use graph::components::store::{BlockStore, DeploymentLocator};
+use graph::components::network_provider::ChainName;
+use graph::components::store::{BlockStore, DeploymentLocator, EthereumCallCache};
 use graph::components::subgraph::Settings;
 use graph::data::graphql::load_manager::LoadManager;
 use graph::data::query::{Query, QueryTarget};
@@ -28,16 +28,22 @@ use graph::data::subgraph::schema::{SubgraphError, SubgraphHealth};
 use graph::endpoint::EndpointMetrics;
 use graph::env::EnvVars;
 use graph::firehose::{FirehoseEndpoint, FirehoseEndpoints, SubgraphLimit};
-use graph::ipfs_client::IpfsClient;
+use graph::futures03::{Stream, StreamExt};
+use graph::http_body_util::Full;
+use graph::hyper::body::Bytes;
+use graph::hyper::Request;
+use graph::ipfs::IpfsClient;
 use graph::prelude::ethabi::ethereum_types::H256;
 use graph::prelude::serde_json::{self, json};
 use graph::prelude::{
-    async_trait, lazy_static, r, ApiVersion, BigInt, BlockNumber, DeploymentHash,
+    async_trait, lazy_static, q, r, ApiVersion, BigInt, BlockNumber, DeploymentHash,
     GraphQlRunner as _, IpfsResolver, LoggerFactory, NodeId, QueryError,
     SubgraphAssignmentProvider, SubgraphCountMetric, SubgraphName, SubgraphRegistrar,
     SubgraphStore as _, SubgraphVersionSwitchingMode, TriggerProcessor,
 };
 use graph::schema::InputSchema;
+use graph_chain_ethereum::chain::RuntimeAdapterBuilder;
+use graph_chain_ethereum::network::EthereumNetworkAdapters;
 use graph_chain_ethereum::Chain;
 use graph_core::polling_monitor::{arweave_service, ipfs_service};
 use graph_core::{
@@ -91,16 +97,17 @@ impl CommonChainConfig {
         let chain_store = stores.chain_store.cheap_clone();
         let node_id = NodeId::new(NODE_ID).unwrap();
 
-        let firehose_endpoints: FirehoseEndpoints = vec![Arc::new(FirehoseEndpoint::new(
-            "",
-            "https://example.com",
-            None,
-            true,
-            false,
-            SubgraphLimit::Unlimited,
-            Arc::new(EndpointMetrics::mock()),
-        ))]
-        .into();
+        let firehose_endpoints =
+            FirehoseEndpoints::for_testing(vec![Arc::new(FirehoseEndpoint::new(
+                "",
+                "https://example.com",
+                None,
+                None,
+                true,
+                false,
+                SubgraphLimit::Unlimited,
+                Arc::new(EndpointMetrics::mock()),
+            ))]);
 
         Self {
             logger_factory,
@@ -161,9 +168,9 @@ pub struct TestContext {
     pub link_resolver: Arc<dyn graph::components::link_resolver::LinkResolver>,
     pub arweave_resolver: Arc<dyn ArweaveResolver>,
     pub env_vars: Arc<EnvVars>,
-    pub ipfs: IpfsClient,
+    pub ipfs: Arc<dyn IpfsClient>,
     graphql_runner: Arc<GraphQlRunner>,
-    indexing_status_service: Arc<IndexNodeService<GraphQlRunner, graph_store_postgres::Store>>,
+    indexing_status_service: Arc<IndexNodeService<graph_store_postgres::Store>>,
 }
 
 #[derive(Deserialize)]
@@ -202,6 +209,10 @@ impl TestContext {
         let (logger, deployment, raw) = self.get_runner_context().await;
         let tp: Box<dyn TriggerProcessor<_, _>> = Box::new(SubgraphTriggerProcessor {});
 
+        let deployment_status_metric = self
+            .instance_manager
+            .new_deployment_status_metric(&deployment);
+
         self.instance_manager
             .build_subgraph_runner(
                 logger,
@@ -210,6 +221,7 @@ impl TestContext {
                 raw,
                 Some(stop_block.block_number()),
                 tp,
+                deployment_status_metric,
             )
             .await
             .unwrap()
@@ -223,7 +235,13 @@ impl TestContext {
         RuntimeHostBuilder<graph_chain_substreams::Chain>,
     > {
         let (logger, deployment, raw) = self.get_runner_context().await;
-        let tp: Box<dyn TriggerProcessor<_, _>> = Box::new(SubgraphTriggerProcessor {});
+        let tp: Box<dyn TriggerProcessor<_, _>> = Box::new(
+            graph_chain_substreams::TriggerProcessor::new(deployment.clone()),
+        );
+
+        let deployment_status_metric = self
+            .instance_manager
+            .new_deployment_status_metric(&deployment);
 
         self.instance_manager
             .build_subgraph_runner(
@@ -233,6 +251,7 @@ impl TestContext {
                 raw,
                 Some(stop_block.block_number()),
                 tp,
+                deployment_status_metric,
             )
             .await
             .unwrap()
@@ -296,11 +315,7 @@ impl TestContext {
 
     pub async fn query(&self, query: &str) -> Result<Option<r::Value>, Vec<QueryError>> {
         let target = QueryTarget::Deployment(self.deployment.hash.clone(), ApiVersion::default());
-        let query = Query::new(
-            graphql_parser::parse_query(query).unwrap().into_static(),
-            None,
-            false,
-        );
+        let query = Query::new(q::parse_query(query).unwrap().into_static(), None, false);
         let query_res = self.graphql_runner.clone().run_query(query, target).await;
         query_res.first().unwrap().duplicate().to_result()
     }
@@ -324,7 +339,7 @@ impl TestContext {
             &self.subgraph_name
         );
         let body = json!({ "query": query }).to_string();
-        let req = hyper::Request::new(body.into());
+        let req: Request<Full<Bytes>> = Request::new(body.into());
         let res = self.indexing_status_service.handle_graphql_query(req).await;
         let value = res
             .unwrap()
@@ -355,7 +370,7 @@ impl Drop for TestContext {
 }
 
 pub struct Stores {
-    network_name: String,
+    network_name: ChainName,
     chain_head_listener: Arc<ChainHeadUpdateListener>,
     pub network_store: Arc<Store>,
     chain_store: Arc<ChainStore>,
@@ -394,22 +409,26 @@ pub async fn stores(test_name: &str, store_config_path: &str) -> Stores {
     let store_builder =
         StoreBuilder::new(&logger, &node_id, &config, None, mock_registry.clone()).await;
 
-    let network_name: String = config.chains.chains.iter().next().unwrap().0.to_string();
+    let network_name: ChainName = config
+        .chains
+        .chains
+        .iter()
+        .next()
+        .unwrap()
+        .0
+        .as_str()
+        .into();
     let chain_head_listener = store_builder.chain_head_update_listener();
-    let network_identifiers = vec![(
-        network_name.clone(),
-        ChainIdentifier {
-            net_version: "".into(),
-            genesis_block_hash: test_ptr(0).hash,
-        },
-    )]
-    .into_iter()
-    .collect();
+    let network_identifiers: Vec<ChainName> = vec![network_name.clone()].into_iter().collect();
     let network_store = store_builder.network_store(network_identifiers);
+    let ident = ChainIdentifier {
+        net_version: "".into(),
+        genesis_block_hash: test_ptr(0).hash,
+    };
     let chain_store = network_store
         .block_store()
-        .chain_store(network_name.as_ref())
-        .unwrap_or_else(|| panic!("No chain store for {}", &network_name));
+        .create_chain_store(&network_name, ident)
+        .unwrap_or_else(|_| panic!("No chain store for {}", &network_name));
 
     Stores {
         network_name,
@@ -452,14 +471,22 @@ pub async fn setup<C: Blockchain>(
 
     let static_filters = env_vars.experimental_static_filters;
 
-    let ipfs = IpfsClient::localhost();
+    let ipfs_client: Arc<dyn IpfsClient> = Arc::new(
+        graph::ipfs::IpfsRpcClient::new_unchecked(
+            graph::ipfs::ServerAddress::local_rpc_api(),
+            &logger,
+        )
+        .unwrap(),
+    );
+
     let link_resolver = Arc::new(IpfsResolver::new(
-        vec![ipfs.cheap_clone()],
+        ipfs_client.cheap_clone(),
         Default::default(),
     ));
+
     let ipfs_service = ipfs_service(
-        ipfs.cheap_clone(),
-        env_vars.mappings.max_ipfs_file_bytes as u64,
+        ipfs_client.cheap_clone(),
+        env_vars.mappings.max_ipfs_file_bytes,
         env_vars.mappings.ipfs_timeout,
         env_vars.mappings.ipfs_request_limit,
     );
@@ -467,7 +494,6 @@ pub async fn setup<C: Blockchain>(
     let arweave_resolver = Arc::new(ArweaveClient::default());
     let arweave_service = arweave_service(
         arweave_resolver.cheap_clone(),
-        env_vars.mappings.ipfs_timeout,
         env_vars.mappings.ipfs_request_limit,
         match env_vars.mappings.max_ipfs_file_bytes {
             0 => FileSizeLimit::Unlimited,
@@ -504,7 +530,6 @@ pub async fn setup<C: Blockchain>(
     let indexing_status_service = Arc::new(IndexNodeService::new(
         logger.cheap_clone(),
         blockchain_map.cheap_clone(),
-        graphql_runner.cheap_clone(),
         stores.network_store.cheap_clone(),
         link_resolver.cheap_clone(),
     ));
@@ -564,7 +589,7 @@ pub async fn setup<C: Blockchain>(
         link_resolver,
         env_vars,
         indexing_status_service,
-        ipfs,
+        ipfs: ipfs_client,
         arweave_resolver,
     }
 }
@@ -866,6 +891,19 @@ impl<C: Blockchain> RuntimeAdapter<C> for NoopRuntimeAdapter<C> {
     }
 }
 
+struct NoopRuntimeAdapterBuilder {}
+
+impl RuntimeAdapterBuilder for NoopRuntimeAdapterBuilder {
+    fn build(
+        &self,
+        _: Arc<EthereumNetworkAdapters>,
+        _: Arc<dyn EthereumCallCache + 'static>,
+        _: Arc<ChainIdentifier>,
+    ) -> Arc<dyn graph::blockchain::RuntimeAdapter<graph_chain_ethereum::Chain> + 'static> {
+        Arc::new(NoopRuntimeAdapter { x: PhantomData })
+    }
+}
+
 pub struct NoopAdapterSelector<C> {
     pub x: PhantomData<C>,
     pub triggers_in_block_sleep: Duration,
@@ -926,6 +964,7 @@ impl<C: Blockchain> TriggersAdapter<C> for MockTriggersAdapter<C> {
         &self,
         _ptr: BlockPtr,
         _offset: BlockNumber,
+        _root: Option<BlockHash>,
     ) -> Result<Option<<C as Blockchain>::Block>, Error> {
         todo!()
     }
@@ -935,7 +974,7 @@ impl<C: Blockchain> TriggersAdapter<C> for MockTriggersAdapter<C> {
         _from: BlockNumber,
         _to: BlockNumber,
         _filter: &<C as Blockchain>::TriggerFilter,
-    ) -> Result<Vec<BlockWithTriggers<C>>, Error> {
+    ) -> Result<(Vec<BlockWithTriggers<C>>, BlockNumber), Error> {
         todo!()
     }
 

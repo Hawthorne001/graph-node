@@ -10,13 +10,14 @@ use graph::data::store::scalar::Bytes;
 use graph::data::store::Value;
 use graph::data::subgraph::schema::SubgraphError;
 use graph::data::subgraph::{
-    Prune, SPEC_VERSION_0_0_4, SPEC_VERSION_0_0_7, SPEC_VERSION_0_0_8, SPEC_VERSION_0_0_9,
-    SPEC_VERSION_1_0_0,
+    Prune, LATEST_VERSION, SPEC_VERSION_0_0_4, SPEC_VERSION_0_0_7, SPEC_VERSION_0_0_8,
+    SPEC_VERSION_0_0_9, SPEC_VERSION_1_0_0, SPEC_VERSION_1_2_0,
 };
 use graph::data_source::offchain::OffchainDataSourceKind;
 use graph::data_source::DataSourceTemplate;
 use graph::entity;
 use graph::env::ENV_VARS;
+use graph::prelude::web3::types::H256;
 use graph::prelude::{
     anyhow, async_trait, serde_yaml, tokio, BigDecimal, BigInt, DeploymentHash, Link, Logger,
     SubgraphManifest, SubgraphManifestValidationError, SubgraphStore, UnvalidatedSubgraphManifest,
@@ -551,6 +552,77 @@ specVersion: 0.0.8
 }
 
 #[tokio::test]
+async fn parse_event_handlers_with_topics() {
+    const YAML: &str = "
+dataSources:
+  - kind: ethereum/contract
+    name: Factory
+    network: mainnet
+    source:
+      abi: Factory
+      startBlock: 9562480
+      endBlock: 9562481
+    mapping:
+      kind: ethereum/events
+      apiVersion: 0.0.4
+      language: wasm/assemblyscript
+      entities:
+        - TestEntity
+      file:
+        /: /ipfs/Qmmapping
+      abis:
+        - name: Factory
+          file:
+            /: /ipfs/Qmabi
+      eventHandlers:
+        - event: Test(address,string)
+          handler: handleTest
+          topic1: [\"0x0000000000000000000000000000000000000000000000000000000000000000\", \"0x0000000000000000000000000000000000000000000000000000000000000001\", \"0x0000000000000000000000000000000000000000000000000000000000000002\" ]
+          topic2: [\"0x0000000000000000000000000000000000000000000000000000000000000001\"]
+          topic3: [\"0x0000000000000000000000000000000000000000000000000000000000000002\"]
+schema:
+  file:
+    /: /ipfs/Qmschema
+specVersion: 1.2.0
+";
+
+    let manifest = resolve_manifest(YAML, SPEC_VERSION_1_2_0).await;
+    // Check if end block is parsed correctly
+    let data_source = manifest.data_sources.first().unwrap();
+    let topic1 = &data_source.as_onchain().unwrap().mapping.event_handlers[0].topic1;
+    let topic2 = &data_source.as_onchain().unwrap().mapping.event_handlers[0].topic2;
+    let topic3 = &data_source.as_onchain().unwrap().mapping.event_handlers[0].topic3;
+
+    assert_eq!(
+        Some(vec![
+            H256::from_str("0000000000000000000000000000000000000000000000000000000000000000")
+                .unwrap(),
+            H256::from_str("0000000000000000000000000000000000000000000000000000000000000001")
+                .unwrap(),
+            H256::from_str("0000000000000000000000000000000000000000000000000000000000000002")
+                .unwrap()
+        ]),
+        topic1.clone()
+    );
+
+    assert_eq!(
+        Some(vec![H256::from_str(
+            "0000000000000000000000000000000000000000000000000000000000000001"
+        )
+        .unwrap()]),
+        topic2.clone()
+    );
+
+    assert_eq!(
+        Some(vec![H256::from_str(
+            "0000000000000000000000000000000000000000000000000000000000000002"
+        )
+        .unwrap()]),
+        topic3.clone()
+    );
+}
+
+#[tokio::test]
 async fn parse_block_handlers_with_polling_filter() {
     const YAML: &str = "
 dataSources:
@@ -592,7 +664,7 @@ specVersion: 0.0.8
         .collect::<Vec<_>>();
 
     let data_source = onchain_data_sources.get(0).unwrap();
-    let validation_errors = data_source.validate();
+    let validation_errors = data_source.validate(&LATEST_VERSION);
     let filter = data_source.mapping.block_handlers[0].filter.clone();
 
     assert_eq!(0, validation_errors.len());
@@ -688,7 +760,7 @@ specVersion: 0.0.8
         .collect::<Vec<_>>();
 
     let data_source = onchain_data_sources.get(0).unwrap();
-    let validation_errors = data_source.validate();
+    let validation_errors = data_source.validate(LATEST_VERSION);
     let filters = data_source
         .mapping
         .block_handlers
@@ -753,7 +825,7 @@ specVersion: 0.0.8
         .collect::<Vec<_>>();
 
     let data_source = onchain_data_sources.get(0).unwrap();
-    let validation_errors = data_source.validate();
+    let validation_errors = data_source.validate(LATEST_VERSION);
     let filters = data_source
         .mapping
         .block_handlers
@@ -1300,5 +1372,76 @@ schema:
 
         let manifest = resolve_manifest(YAML, SPEC_VERSION_0_0_4).await;
         assert!(manifest.features.contains(&SubgraphFeature::NonFatalErrors))
+    });
+}
+
+#[test]
+fn parses_eth_call_decls() {
+    const YAML: &str = "
+specVersion: 1.2.0
+schema:
+  file:
+    /: /ipfs/Qmschema
+features:
+  - ipfsOnEthereumContracts
+dataSources:
+  - kind: ethereum/contract
+    name: Factory
+    network: mainnet
+    source:
+      abi: Factory
+      startBlock: 9562480
+    mapping:
+      kind: ethereum/events
+      apiVersion: 0.0.4
+      language: wasm/assemblyscript
+      entities:
+        - TestEntity
+      file:
+        /: /ipfs/Qmmapping
+      abis:
+        - name: Factory
+          file:
+            /: /ipfs/Qmabi
+      eventHandlers:
+        - event: Created(address)
+          handler: handleGet
+          calls:
+            fake1: Factory[event.address].get(event.params.address)
+            fake2: Factory[event.params.address].get(event.params.address)
+            fake3: Factory[0xDeaDbeefdEAdbeefdEadbEEFdeadbeEFdEaDbeeF].get(event.address)
+            fake4: Factory[0xDeaDbeefdEAdbeefdEadbEEFdeadbeEFdEaDbeeF].get(0xDeaDbeefdEAdbeefdEadbEEFdeadbeEFdEaDbeeF)
+";
+
+    test_store::run_test_sequentially(|store| async move {
+        let store = store.subgraph_store();
+        let unvalidated: UnvalidatedSubgraphManifest<Chain> = {
+            let mut resolver = TextResolver::default();
+            let id = DeploymentHash::new("Qmmanifest").unwrap();
+            resolver.add(id.as_str(), &YAML);
+            resolver.add("/ipfs/Qmabi", &ABI);
+            resolver.add("/ipfs/Qmschema", &GQL_SCHEMA);
+            resolver.add("/ipfs/Qmmapping", &MAPPING_WITH_IPFS_FUNC_WASM);
+
+            let resolver: Arc<dyn LinkResolverTrait> = Arc::new(resolver);
+
+            let raw = serde_yaml::from_str(YAML).unwrap();
+            UnvalidatedSubgraphManifest::resolve(
+                id,
+                raw,
+                &resolver,
+                &LOGGER,
+                SPEC_VERSION_1_2_0.clone(),
+            )
+            .await
+            .expect("Parsing simple manifest works")
+        };
+
+        let manifest = unvalidated.validate(store.clone(), true).await.unwrap();
+        let ds = &manifest.data_sources[0].as_onchain().unwrap();
+        // For more detailed tests of parsing CallDecls see the data_soure
+        // module in chain/ethereum
+        let decls = &ds.mapping.event_handlers[0].calls.decls;
+        assert_eq!(4, decls.len());
     });
 }

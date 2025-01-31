@@ -10,7 +10,7 @@ pub mod status;
 
 pub use features::{SubgraphFeature, SubgraphFeatureValidationError};
 
-use crate::{components::store::BLOCK_NUMBER_MAX, object};
+use crate::{cheap_clone::CheapClone, components::store::BLOCK_NUMBER_MAX, object};
 use anyhow::{anyhow, Context, Error};
 use futures03::{future::try_join, stream::FuturesOrdered, TryStreamExt as _};
 use itertools::Itertools;
@@ -46,8 +46,9 @@ use crate::{
         offchain::OFFCHAIN_KINDS, DataSource, DataSourceTemplate, UnresolvedDataSource,
         UnresolvedDataSourceTemplate,
     },
+    derive::CacheWeight,
     ensure,
-    prelude::{r, CheapClone, Value, ENV_VARS},
+    prelude::{r, Value, ENV_VARS},
     schema::{InputSchema, SchemaValidationError},
 };
 
@@ -59,6 +60,8 @@ use std::str::FromStr;
 use std::sync::Arc;
 
 use super::{graphql::IntoValue, value::Word};
+
+pub const SUBSTREAMS_KIND: &str = "substreams";
 
 /// Deserialize an Address (with or without '0x' prefix).
 fn deserialize_address<'de, D>(deserializer: D) -> Result<Option<Address>, D::Error>
@@ -76,8 +79,14 @@ where
 
 /// The IPFS hash used to identifiy a deployment externally, i.e., the
 /// `Qm..` string that `graph-cli` prints when deploying to a subgraph
-#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Default)]
+#[derive(Clone, CacheWeight, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Default)]
 pub struct DeploymentHash(String);
+
+impl CheapClone for DeploymentHash {
+    fn cheap_clone(&self) -> Self {
+        self.clone()
+    }
+}
 
 impl stable_hash_legacy::StableHash for DeploymentHash {
     #[inline]
@@ -99,9 +108,6 @@ impl StableHash for DeploymentHash {
 }
 
 impl_slog_value!(DeploymentHash);
-
-/// `DeploymentHash` is fixed-length so cheap to clone.
-impl CheapClone for DeploymentHash {}
 
 impl DeploymentHash {
     /// Check that `s` is a valid `SubgraphDeploymentId` and create a new one.
@@ -494,13 +500,7 @@ impl Graft {
             // The graft point must be at least `reorg_threshold` blocks
             // behind the subgraph head so that a reorg can not affect the
             // data that we copy for grafting
-            //
-            // This is pretty nasty: we have tests in the subgraph runner
-            // tests that graft onto the subgraph head directly. We
-            // therefore skip this check in debug builds and only turn it on
-            // in release builds
-            #[cfg(not(debug_assertions))]
-            (Some(ptr), true) if self.block + ENV_VARS.reorg_threshold >= ptr.number => Err(GraftBaseInvalid(format!(
+            (Some(ptr), true) if self.block + ENV_VARS.reorg_threshold > ptr.number => Err(GraftBaseInvalid(format!(
                 "failed to graft onto `{}` at block {} since it's only at block {} which is within the reorg threshold of {} blocks",
                 self.base, self.block, ptr.number, ENV_VARS.reorg_threshold
             ))),
@@ -527,6 +527,10 @@ pub struct DeploymentFeatures {
     pub data_source_kinds: Vec<String>,
     pub network: String,
     pub handler_kinds: Vec<String>,
+    pub has_declared_calls: bool,
+    pub has_bytes_as_ids: bool,
+    pub has_aggregations: bool,
+    pub immutable_entities: Vec<String>,
 }
 
 impl IntoValue for DeploymentFeatures {
@@ -539,6 +543,10 @@ impl IntoValue for DeploymentFeatures {
             dataSources: self.data_source_kinds,
             handlers: self.handler_kinds,
             network: self.network,
+            hasDeclaredEthCalls: self.has_declared_calls,
+            hasBytesAsIds: self.has_bytes_as_ids,
+            hasAggregations: self.has_aggregations,
+            immutableEntities: self.immutable_entities
         }
     }
 }
@@ -691,7 +699,7 @@ impl<C: Blockchain> UnvalidatedSubgraphManifest<C> {
         }
 
         for ds in &self.0.data_sources {
-            errors.extend(ds.validate().into_iter().map(|e| {
+            errors.extend(ds.validate(&self.0.spec_version).into_iter().map(|e| {
                 SubgraphManifestValidationError::DataSourceValidation(ds.name().to_owned(), e)
             }));
         }
@@ -791,6 +799,14 @@ impl<C: Blockchain> SubgraphManifest<C> {
     pub fn deployment_features(&self) -> DeploymentFeatures {
         let unified_api_version = self.unified_mapping_api_version().ok();
         let network = self.network_name();
+        let has_declared_calls = self.data_sources.iter().any(|ds| ds.has_declared_calls());
+        let has_aggregations = self.schema.has_aggregations();
+        let immutable_entities = self
+            .schema
+            .immutable_entities()
+            .map(|s| s.to_string())
+            .collect_vec();
+
         let api_version = unified_api_version
             .map(|v| v.version().map(|v| v.to_string()))
             .flatten();
@@ -834,6 +850,10 @@ impl<C: Blockchain> SubgraphManifest<C> {
                 .map(|s| s.to_string())
                 .collect_vec(),
             network,
+            has_declared_calls,
+            has_bytes_as_ids: self.schema.has_bytes_as_ids(),
+            immutable_entities,
+            has_aggregations,
         }
     }
 
@@ -937,6 +957,14 @@ impl<C: Blockchain> UnresolvedSubgraphManifest<C> {
         )
         .await?;
 
+        let is_substreams = data_sources.iter().any(|ds| ds.kind() == SUBSTREAMS_KIND);
+        if is_substreams && ds_count > 1 {
+            return Err(anyhow!(
+                "A Substreams-based subgraph can only contain a single data source."
+            )
+            .into());
+        }
+
         for ds in &data_sources {
             ensure!(
                 semver::VersionReq::parse(&format!("<= {}", ENV_VARS.mappings.max_api_version))
@@ -1026,6 +1054,8 @@ pub struct DeploymentState {
     pub latest_block: BlockPtr,
     /// The earliest block that the subgraph has processed
     pub earliest_block_number: BlockNumber,
+    /// The first block at which the subgraph has a deterministic error
+    pub first_error_block: Option<BlockNumber>,
 }
 
 impl DeploymentState {
@@ -1050,6 +1080,13 @@ impl DeploymentState {
             ));
         }
         Ok(())
+    }
+
+    /// Return `true` if the subgraph has a deterministic error visible at
+    /// `block`
+    pub fn has_deterministic_errors(&self, block: &BlockPtr) -> bool {
+        self.first_error_block
+            .map_or(false, |first_error_block| first_error_block <= block.number)
     }
 }
 

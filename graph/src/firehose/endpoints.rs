@@ -1,37 +1,38 @@
-use crate::{
-    blockchain::block_stream::FirehoseCursor,
-    blockchain::Block as BlockchainBlock,
-    blockchain::BlockPtr,
-    cheap_clone::CheapClone,
-    components::store::BlockNumber,
-    data::value::Word,
-    endpoint::{ConnectionType, EndpointMetrics, Provider, RequestLabels},
-    firehose::decode_firehose_block,
-    prelude::{anyhow, debug, info},
-    substreams_rpc,
-};
-
 use crate::firehose::fetch_client::FetchClient;
 use crate::firehose::interceptors::AuthInterceptor;
+use crate::{
+    blockchain::{
+        block_stream::FirehoseCursor, Block as BlockchainBlock, BlockPtr, ChainIdentifier,
+    },
+    cheap_clone::CheapClone,
+    components::store::BlockNumber,
+    endpoint::{ConnectionType, EndpointMetrics, RequestLabels},
+    env::ENV_VARS,
+    firehose::decode_firehose_block,
+    prelude::{anyhow, debug, DeploymentHash},
+    substreams_rpc,
+};
+use async_trait::async_trait;
 use futures03::StreamExt;
-use http::uri::{Scheme, Uri};
+use http0::uri::{Scheme, Uri};
 use itertools::Itertools;
 use slog::Logger;
-use std::{
-    collections::{BTreeMap, HashMap},
-    fmt::Display,
-    ops::ControlFlow,
-    sync::Arc,
-    time::Duration,
-};
+use std::{collections::HashMap, fmt::Display, ops::ControlFlow, sync::Arc, time::Duration};
+use tokio::sync::OnceCell;
 use tonic::codegen::InterceptedService;
 use tonic::{
     codegen::CompressionEncoding,
-    metadata::{Ascii, MetadataValue},
+    metadata::{Ascii, MetadataKey, MetadataValue},
     transport::{Channel, ClientTlsConfig},
+    Request,
 };
 
 use super::{codec as firehose, interceptors::MetricsInterceptor, stream_client::StreamClient};
+use crate::components::network_provider::ChainName;
+use crate::components::network_provider::NetworkDetails;
+use crate::components::network_provider::ProviderCheckStrategy;
+use crate::components::network_provider::ProviderManager;
+use crate::components::network_provider::ProviderName;
 
 /// This is constant because we found this magic number of connections after
 /// which the grpc connections start to hang.
@@ -44,13 +45,62 @@ const HIGH_VALUE_USED_PERCENTAGE: usize = 80;
 
 #[derive(Debug)]
 pub struct FirehoseEndpoint {
-    pub provider: Provider,
+    pub provider: ProviderName,
     pub auth: AuthInterceptor,
     pub filters_enabled: bool,
     pub compression_enabled: bool,
     pub subgraph_limit: SubgraphLimit,
     endpoint_metrics: Arc<EndpointMetrics>,
     channel: Channel,
+
+    /// The endpoint info is not intended to change very often, as it only contains the
+    /// endpoint's metadata, so caching it avoids sending unnecessary network requests.
+    info_response: OnceCell<crate::firehose::endpoint_info::InfoResponse>,
+}
+
+#[derive(Debug)]
+pub struct ConnectionHeaders(HashMap<MetadataKey<Ascii>, MetadataValue<Ascii>>);
+
+#[async_trait]
+impl NetworkDetails for Arc<FirehoseEndpoint> {
+    fn provider_name(&self) -> ProviderName {
+        self.provider.clone()
+    }
+
+    async fn chain_identifier(&self) -> anyhow::Result<ChainIdentifier> {
+        let genesis_block_ptr = self.clone().info().await?.genesis_block_ptr()?;
+
+        Ok(ChainIdentifier {
+            net_version: "0".to_string(),
+            genesis_block_hash: genesis_block_ptr.hash,
+        })
+    }
+
+    async fn provides_extended_blocks(&self) -> anyhow::Result<bool> {
+        let info = self.clone().info().await?;
+
+        Ok(info.block_features.iter().all(|x| x == "extended"))
+    }
+}
+
+impl ConnectionHeaders {
+    pub fn new() -> Self {
+        Self(HashMap::new())
+    }
+    pub fn with_deployment(mut self, deployment: DeploymentHash) -> Self {
+        if let Ok(deployment) = deployment.parse() {
+            self.0
+                .insert("x-deployment-id".parse().unwrap(), deployment);
+        }
+        self
+    }
+    pub fn add_to_request<T>(&self, request: T) -> Request<T> {
+        let mut request = Request::new(request);
+        self.0.iter().for_each(|(k, v)| {
+            request.metadata_mut().insert(k, v.clone());
+        });
+        request
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Ord, Eq, PartialOrd)]
@@ -119,6 +169,7 @@ impl FirehoseEndpoint {
         provider: S,
         url: S,
         token: Option<String>,
+        key: Option<String>,
         filters_enabled: bool,
         compression_enabled: bool,
         subgraph_limit: SubgraphLimit,
@@ -144,6 +195,12 @@ impl FirehoseEndpoint {
                 bearer_token.parse::<MetadataValue<Ascii>>().map(Some)
             })
             .expect("Firehose token is invalid");
+
+        let key: Option<MetadataValue<Ascii>> = key
+            .map_or(Ok(None), |key| {
+                key.parse::<MetadataValue<Ascii>>().map(Some)
+            })
+            .expect("Firehose key is invalid");
 
         // Note on the connection window size: We run multiple block streams on a same connection,
         // and a problematic subgraph with a stalled block stream might consume the entire window
@@ -174,11 +231,12 @@ impl FirehoseEndpoint {
         FirehoseEndpoint {
             provider: provider.as_ref().into(),
             channel: endpoint.connect_lazy(),
-            auth: AuthInterceptor { token },
+            auth: AuthInterceptor { token, key },
             filters_enabled,
             compression_enabled,
             subgraph_limit,
             endpoint_metrics,
+            info_response: OnceCell::new(),
         }
     }
 
@@ -193,12 +251,8 @@ impl FirehoseEndpoint {
             .get_capacity(Arc::strong_count(self).saturating_sub(1))
     }
 
-    fn new_client(
-        &self,
-    ) -> FetchClient<
-        InterceptedService<MetricsInterceptor<Channel>, impl tonic::service::Interceptor>,
-    > {
-        let metrics = MetricsInterceptor {
+    fn metrics_interceptor(&self) -> MetricsInterceptor<Channel> {
+        MetricsInterceptor {
             metrics: self.endpoint_metrics.cheap_clone(),
             service: self.channel.cheap_clone(),
             labels: RequestLabels {
@@ -206,16 +260,28 @@ impl FirehoseEndpoint {
                 req_type: "unknown".into(),
                 conn_type: ConnectionType::Firehose,
             },
-        };
+        }
+    }
 
-        let mut client: FetchClient<
-            InterceptedService<MetricsInterceptor<Channel>, AuthInterceptor>,
-        > = FetchClient::with_interceptor(metrics, self.auth.clone())
+    fn max_message_size(&self) -> usize {
+        1024 * 1024 * ENV_VARS.firehose_grpc_max_decode_size_mb
+    }
+
+    fn new_fetch_client(
+        &self,
+    ) -> FetchClient<
+        InterceptedService<MetricsInterceptor<Channel>, impl tonic::service::Interceptor>,
+    > {
+        let metrics = self.metrics_interceptor();
+
+        let mut client = FetchClient::with_interceptor(metrics, self.auth.clone())
             .accept_compressed(CompressionEncoding::Gzip);
 
         if self.compression_enabled {
             client = client.send_compressed(CompressionEncoding::Gzip);
         }
+
+        client = client.max_decoding_message_size(self.max_message_size());
 
         client
     }
@@ -225,15 +291,7 @@ impl FirehoseEndpoint {
     ) -> StreamClient<
         InterceptedService<MetricsInterceptor<Channel>, impl tonic::service::Interceptor>,
     > {
-        let metrics = MetricsInterceptor {
-            metrics: self.endpoint_metrics.cheap_clone(),
-            service: self.channel.cheap_clone(),
-            labels: RequestLabels {
-                provider: self.provider.clone().into(),
-                req_type: "unknown".into(),
-                conn_type: ConnectionType::Firehose,
-            },
-        };
+        let metrics = self.metrics_interceptor();
 
         let mut client = StreamClient::with_interceptor(metrics, self.auth.clone())
             .accept_compressed(CompressionEncoding::Gzip);
@@ -241,6 +299,8 @@ impl FirehoseEndpoint {
         if self.compression_enabled {
             client = client.send_compressed(CompressionEncoding::Gzip);
         }
+
+        client = client.max_decoding_message_size(self.max_message_size());
 
         client
     }
@@ -250,15 +310,7 @@ impl FirehoseEndpoint {
     ) -> substreams_rpc::stream_client::StreamClient<
         InterceptedService<MetricsInterceptor<Channel>, impl tonic::service::Interceptor>,
     > {
-        let metrics = MetricsInterceptor {
-            metrics: self.endpoint_metrics.cheap_clone(),
-            service: self.channel.cheap_clone(),
-            labels: RequestLabels {
-                provider: self.provider.clone().into(),
-                req_type: "unknown".into(),
-                conn_type: ConnectionType::Substreams,
-            },
-        };
+        let metrics = self.metrics_interceptor();
 
         let mut client = substreams_rpc::stream_client::StreamClient::with_interceptor(
             metrics,
@@ -269,6 +321,8 @@ impl FirehoseEndpoint {
         if self.compression_enabled {
             client = client.send_compressed(CompressionEncoding::Gzip);
         }
+
+        client = client.max_decoding_message_size(self.max_message_size());
 
         client
     }
@@ -283,7 +337,8 @@ impl FirehoseEndpoint {
     {
         debug!(
             logger,
-            "Connecting to firehose to retrieve block for cursor {}", cursor
+            "Connecting to firehose to retrieve block for cursor {}", cursor;
+            "provider" => self.provider.as_str(),
         );
 
         let req = firehose::SingleBlockRequest {
@@ -295,26 +350,13 @@ impl FirehoseEndpoint {
             )),
         };
 
-        let mut client = self.new_client();
+        let mut client = self.new_fetch_client();
         match client.block(req).await {
             Ok(v) => Ok(M::decode(
                 v.get_ref().block.as_ref().unwrap().value.as_ref(),
             )?),
             Err(e) => return Err(anyhow::format_err!("firehose error {}", e)),
         }
-    }
-
-    pub async fn genesis_block_ptr<M>(&self, logger: &Logger) -> Result<BlockPtr, anyhow::Error>
-    where
-        M: prost::Message + BlockchainBlock + Default + 'static,
-    {
-        info!(logger, "Requesting genesis block from firehose");
-
-        // We use 0 here to mean the genesis block of the chain. Firehose
-        // when seeing start block number 0 will always return the genesis
-        // block of the chain, even if the chain's start block number is
-        // not starting at block #0.
-        self.block_ptr_for_number::<M>(logger, 0).await
     }
 
     pub async fn block_ptr_for_number<M>(
@@ -327,7 +369,8 @@ impl FirehoseEndpoint {
     {
         debug!(
             logger,
-            "Connecting to firehose to retrieve block for number {}", number
+            "Connecting to firehose to retrieve block for number {}", number;
+            "provider" => self.provider.as_str(),
         );
 
         let mut client = self.new_stream_client();
@@ -355,7 +398,8 @@ impl FirehoseEndpoint {
 
         let mut block_stream = response_stream.into_inner();
 
-        debug!(logger, "Retrieving block(s) from firehose");
+        debug!(logger, "Retrieving block(s) from firehose";
+               "provider" => self.provider.as_str());
 
         let mut latest_received_block: Option<BlockPtr> = None;
         while let Some(message) = block_stream.next().await {
@@ -399,8 +443,10 @@ impl FirehoseEndpoint {
     pub async fn stream_blocks(
         self: Arc<Self>,
         request: firehose::Request,
+        headers: &ConnectionHeaders,
     ) -> Result<tonic::Streaming<firehose::Response>, anyhow::Error> {
         let mut client = self.new_stream_client();
+        let request = headers.add_to_request(request);
         let response_stream = client.blocks(request).await?;
         let block_stream = response_stream.into_inner();
 
@@ -410,34 +456,77 @@ impl FirehoseEndpoint {
     pub async fn substreams(
         self: Arc<Self>,
         request: substreams_rpc::Request,
+        headers: &ConnectionHeaders,
     ) -> Result<tonic::Streaming<substreams_rpc::Response>, anyhow::Error> {
         let mut client = self.new_substreams_client();
+        let request = headers.add_to_request(request);
         let response_stream = client.blocks(request).await?;
         let block_stream = response_stream.into_inner();
 
         Ok(block_stream)
     }
+
+    pub async fn info(
+        self: Arc<Self>,
+    ) -> Result<crate::firehose::endpoint_info::InfoResponse, anyhow::Error> {
+        let endpoint = self.cheap_clone();
+
+        self.info_response
+            .get_or_try_init(move || async move {
+                let metrics = endpoint.metrics_interceptor();
+                let auth = endpoint.auth.clone();
+
+                let mut client = crate::firehose::endpoint_info::Client::new(metrics, auth);
+
+                if endpoint.compression_enabled {
+                    client = client.with_compression();
+                }
+
+                client = client.with_max_message_size(endpoint.max_message_size());
+
+                client.info().await
+            })
+            .await
+            .map(ToOwned::to_owned)
+    }
 }
 
-#[derive(Clone, Debug)]
-pub struct FirehoseEndpoints(Vec<Arc<FirehoseEndpoint>>);
+#[derive(Debug)]
+pub struct FirehoseEndpoints(ChainName, ProviderManager<Arc<FirehoseEndpoint>>);
 
 impl FirehoseEndpoints {
-    pub fn new() -> Self {
-        Self(vec![])
+    pub fn for_testing(adapters: Vec<Arc<FirehoseEndpoint>>) -> Self {
+        let chain_name: ChainName = "testing".into();
+
+        Self(
+            chain_name.clone(),
+            ProviderManager::new(
+                crate::log::discard(),
+                [(chain_name, adapters)],
+                ProviderCheckStrategy::MarkAsValid,
+            ),
+        )
+    }
+
+    pub fn new(
+        chain_name: ChainName,
+        provider_manager: ProviderManager<Arc<FirehoseEndpoint>>,
+    ) -> Self {
+        Self(chain_name, provider_manager)
     }
 
     pub fn len(&self) -> usize {
-        self.0.len()
+        self.1.len(&self.0)
     }
 
     /// This function will attempt to grab an endpoint based on the Lowest error count
     //  with high capacity available. If an adapter cannot be found `endpoint` will
     // return an error.
-    pub fn endpoint(&self) -> anyhow::Result<Arc<FirehoseEndpoint>> {
+    pub async fn endpoint(&self) -> anyhow::Result<Arc<FirehoseEndpoint>> {
         let endpoint = self
-            .0
-            .iter()
+            .1
+            .providers(&self.0)
+            .await?
             .sorted_by_key(|x| x.current_error_count())
             .try_fold(None, |acc, adapter| {
                 match adapter.get_capacity() {
@@ -459,66 +548,6 @@ impl FirehoseEndpoints {
             adapter.cloned().ok_or(anyhow!("unable to get a connection, increase the firehose conn_pool_size or limit for the node"))
         }
     }
-
-    pub fn remove(&mut self, provider: &str) {
-        self.0
-            .retain(|network_endpoint| network_endpoint.provider.as_str() != provider);
-    }
-}
-
-impl From<Vec<Arc<FirehoseEndpoint>>> for FirehoseEndpoints {
-    fn from(val: Vec<Arc<FirehoseEndpoint>>) -> Self {
-        FirehoseEndpoints(val)
-    }
-}
-
-#[derive(Clone, Debug)]
-pub struct FirehoseNetworks {
-    /// networks contains a map from chain id (`near-mainnet`, `near-testnet`, `solana-mainnet`, etc.)
-    /// to a list of FirehoseEndpoint (type wrapper around `Arc<Vec<FirehoseEndpoint>>`).
-    pub networks: BTreeMap<String, FirehoseEndpoints>,
-}
-
-impl FirehoseNetworks {
-    pub fn new() -> FirehoseNetworks {
-        FirehoseNetworks {
-            networks: BTreeMap::new(),
-        }
-    }
-
-    pub fn insert(&mut self, chain_id: String, endpoint: Arc<FirehoseEndpoint>) {
-        let endpoints = self
-            .networks
-            .entry(chain_id)
-            .or_insert_with(FirehoseEndpoints::new);
-
-        endpoints.0.push(endpoint);
-    }
-
-    pub fn remove(&mut self, chain_id: &str, provider: &str) {
-        if let Some(endpoints) = self.networks.get_mut(chain_id) {
-            endpoints.remove(provider);
-        }
-    }
-
-    /// Returns a `HashMap` where the key is the chain's id and the key is an endpoint for this chain.
-    /// There can be multiple keys with the same chain id but with different
-    /// endpoint where multiple providers exist for a single chain id. Providers with the same
-    /// label do not need to be tested individually, if one is working, every other endpoint in the
-    /// pool should also work.
-    pub fn flatten(&self) -> HashMap<(String, Word), Arc<FirehoseEndpoint>> {
-        self.networks
-            .iter()
-            .flat_map(|(chain_id, firehose_endpoints)| {
-                firehose_endpoints.0.iter().map(move |endpoint| {
-                    (
-                        (chain_id.clone(), endpoint.provider.clone()),
-                        endpoint.clone(),
-                    )
-                })
-            })
-            .collect()
-    }
 }
 
 #[cfg(test)]
@@ -527,11 +556,10 @@ mod test {
 
     use slog::{o, Discard, Logger};
 
-    use crate::{
-        components::metrics::MetricsRegistry, endpoint::EndpointMetrics, firehose::SubgraphLimit,
-    };
-
-    use super::{AvailableCapacity, FirehoseEndpoint, FirehoseEndpoints, SUBGRAPHS_PER_CONN};
+    use super::*;
+    use crate::components::metrics::MetricsRegistry;
+    use crate::endpoint::EndpointMetrics;
+    use crate::firehose::SubgraphLimit;
 
     #[tokio::test]
     async fn firehose_endpoint_errors() {
@@ -539,29 +567,29 @@ mod test {
             String::new(),
             "http://127.0.0.1".to_string(),
             None,
+            None,
             false,
             false,
             SubgraphLimit::Unlimited,
             Arc::new(EndpointMetrics::mock()),
         ))];
 
-        let mut endpoints = FirehoseEndpoints::from(endpoint);
+        let endpoints = FirehoseEndpoints::for_testing(endpoint);
 
         let mut keep = vec![];
         for _i in 0..SUBGRAPHS_PER_CONN {
-            keep.push(endpoints.endpoint().unwrap());
+            keep.push(endpoints.endpoint().await.unwrap());
         }
 
-        let err = endpoints.endpoint().unwrap_err();
+        let err = endpoints.endpoint().await.unwrap_err();
         assert!(err.to_string().contains("conn_pool_size"));
 
         mem::drop(keep);
-        endpoints.endpoint().unwrap();
+        endpoints.endpoint().await.unwrap();
 
-        // Fails when empty too
-        endpoints.remove("");
+        let endpoints = FirehoseEndpoints::for_testing(vec![]);
 
-        let err = endpoints.endpoint().unwrap_err();
+        let err = endpoints.endpoint().await.unwrap_err();
         assert!(err.to_string().contains("unable to get a connection"));
     }
 
@@ -571,30 +599,25 @@ mod test {
             String::new(),
             "http://127.0.0.1".to_string(),
             None,
+            None,
             false,
             false,
             SubgraphLimit::Limit(2),
             Arc::new(EndpointMetrics::mock()),
         ))];
 
-        let mut endpoints = FirehoseEndpoints::from(endpoint);
+        let endpoints = FirehoseEndpoints::for_testing(endpoint);
 
         let mut keep = vec![];
         for _ in 0..2 {
-            keep.push(endpoints.endpoint().unwrap());
+            keep.push(endpoints.endpoint().await.unwrap());
         }
 
-        let err = endpoints.endpoint().unwrap_err();
+        let err = endpoints.endpoint().await.unwrap_err();
         assert!(err.to_string().contains("conn_pool_size"));
 
         mem::drop(keep);
-        endpoints.endpoint().unwrap();
-
-        // Fails when empty too
-        endpoints.remove("");
-
-        let err = endpoints.endpoint().unwrap_err();
-        assert!(err.to_string().contains("unable to get a connection"));
+        endpoints.endpoint().await.unwrap();
     }
 
     #[tokio::test]
@@ -603,22 +626,17 @@ mod test {
             String::new(),
             "http://127.0.0.1".to_string(),
             None,
+            None,
             false,
             false,
             SubgraphLimit::Disabled,
             Arc::new(EndpointMetrics::mock()),
         ))];
 
-        let mut endpoints = FirehoseEndpoints::from(endpoint);
+        let endpoints = FirehoseEndpoints::for_testing(endpoint);
 
-        let err = endpoints.endpoint().unwrap_err();
+        let err = endpoints.endpoint().await.unwrap_err();
         assert!(err.to_string().contains("conn_pool_size"));
-
-        // Fails when empty too
-        endpoints.remove("");
-
-        let err = endpoints.endpoint().unwrap_err();
-        assert!(err.to_string().contains("unable to get a connection"));
     }
 
     #[tokio::test]
@@ -634,6 +652,7 @@ mod test {
             "high_error".to_string(),
             "http://127.0.0.1".to_string(),
             None,
+            None,
             false,
             false,
             SubgraphLimit::Unlimited,
@@ -642,6 +661,7 @@ mod test {
         let high_error_adapter2 = Arc::new(FirehoseEndpoint::new(
             "high_error".to_string(),
             "http://127.0.0.1".to_string(),
+            None,
             None,
             false,
             false,
@@ -652,6 +672,7 @@ mod test {
             "low availability".to_string(),
             "http://127.0.0.2".to_string(),
             None,
+            None,
             false,
             false,
             SubgraphLimit::Limit(2),
@@ -661,6 +682,7 @@ mod test {
             "high availability".to_string(),
             "http://127.0.0.3".to_string(),
             None,
+            None,
             false,
             false,
             SubgraphLimit::Unlimited,
@@ -669,25 +691,36 @@ mod test {
 
         endpoint_metrics.report_for_test(&high_error_adapter1.provider, false);
 
-        let mut endpoints = FirehoseEndpoints::from(vec![
+        let endpoints = FirehoseEndpoints::for_testing(vec![
             high_error_adapter1.clone(),
-            high_error_adapter2,
+            high_error_adapter2.clone(),
             low_availability.clone(),
             high_availability.clone(),
         ]);
 
-        let res = endpoints.endpoint().unwrap();
+        let res = endpoints.endpoint().await.unwrap();
         assert_eq!(res.provider, high_availability.provider);
+        mem::drop(endpoints);
 
         // Removing high availability without errors should fallback to low availability
-        endpoints.remove(&high_availability.provider);
+        let endpoints = FirehoseEndpoints::for_testing(
+            vec![
+                high_error_adapter1.clone(),
+                high_error_adapter2,
+                low_availability.clone(),
+                high_availability.clone(),
+            ]
+            .into_iter()
+            .filter(|a| a.provider_name() != high_availability.provider)
+            .collect(),
+        );
 
         // Ensure we're in a low capacity situation
         assert_eq!(low_availability.get_capacity(), AvailableCapacity::Low);
 
         // In the scenario where the only high level adapter has errors we keep trying that
         // because the others will be low or unavailable
-        let res = endpoints.endpoint().unwrap();
+        let res = endpoints.endpoint().await.unwrap();
         // This will match both high error adapters
         assert_eq!(res.provider, high_error_adapter1.provider);
     }

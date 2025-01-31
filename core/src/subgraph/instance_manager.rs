@@ -1,15 +1,21 @@
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::Ordering;
+
 use crate::polling_monitor::{ArweaveService, IpfsService};
 use crate::subgraph::context::{IndexingContext, SubgraphKeepAlive};
 use crate::subgraph::inputs::IndexingInputs;
 use crate::subgraph::loader::load_dynamic_data_sources;
+use crate::subgraph::Decoder;
 use std::collections::BTreeSet;
 
 use crate::subgraph::runner::SubgraphRunner;
 use graph::blockchain::block_stream::BlockStreamMetrics;
 use graph::blockchain::{Blockchain, BlockchainKind, DataSource, NodeCapabilities};
 use graph::components::metrics::gas::GasMetrics;
+use graph::components::metrics::subgraph::DeploymentStatusMetric;
 use graph::components::subgraph::ProofOfIndexingVersion;
 use graph::data::subgraph::{UnresolvedSubgraphManifest, SPEC_VERSION_0_0_6};
+use graph::data::value::Word;
 use graph::data_source::causality_region::CausalityRegionSeq;
 use graph::env::EnvVars;
 use graph::prelude::{SubgraphInstanceManager as SubgraphInstanceManagerTrait, *};
@@ -20,6 +26,7 @@ use tokio::task;
 
 use super::context::OffchainMonitor;
 use super::SubgraphTriggerProcessor;
+use crate::subgraph::runner::SubgraphRunnerError;
 
 #[derive(Clone)]
 pub struct SubgraphInstanceManager<S: SubgraphStore> {
@@ -33,6 +40,18 @@ pub struct SubgraphInstanceManager<S: SubgraphStore> {
     arweave_service: ArweaveService,
     static_filters: bool,
     env_vars: Arc<EnvVars>,
+
+    /// By design, there should be only one subgraph runner process per subgraph, but the current
+    /// implementation does not completely prevent multiple runners from being active at the same
+    /// time, and we have already had a [bug][0] due to this limitation. Investigating the problem
+    /// was quite complicated because there was no way to know that the logs were coming from two
+    /// different processes because all the logs looked the same. Ideally, the implementation
+    /// should be refactored to make it more strict, but until then, we keep this counter, which
+    /// is incremented each time a new runner is started, and the previous count is embedded in
+    /// each log of the started runner, to make debugging future issues easier.
+    ///
+    /// [0]: https://github.com/graphprotocol/graph-node/issues/5452
+    subgraph_start_counter: Arc<AtomicU64>,
 }
 
 #[async_trait]
@@ -43,95 +62,99 @@ impl<S: SubgraphStore> SubgraphInstanceManagerTrait for SubgraphInstanceManager<
         manifest: serde_yaml::Mapping,
         stop_block: Option<BlockNumber>,
     ) {
+        let runner_index = self.subgraph_start_counter.fetch_add(1, Ordering::SeqCst);
+
         let logger = self.logger_factory.subgraph_logger(&loc);
+        let logger = logger.new(o!("runner_index" => runner_index));
+
         let err_logger = logger.clone();
         let instance_manager = self.cheap_clone();
 
-        let subgraph_start_future = async move {
-            match BlockchainKind::from_manifest(&manifest)? {
-                BlockchainKind::Arweave => {
-                    let runner = instance_manager
-                        .build_subgraph_runner::<graph_chain_arweave::Chain>(
-                            logger.clone(),
-                            self.env_vars.cheap_clone(),
-                            loc.clone(),
-                            manifest,
-                            stop_block,
-                            Box::new(SubgraphTriggerProcessor {}),
-                        )
-                        .await?;
+        let deployment_status_metric = self.new_deployment_status_metric(&loc);
+        deployment_status_metric.starting();
 
-                    self.start_subgraph_inner(logger, loc, runner).await
-                }
-                BlockchainKind::Ethereum => {
-                    let runner = instance_manager
-                        .build_subgraph_runner::<graph_chain_ethereum::Chain>(
-                            logger.clone(),
-                            self.env_vars.cheap_clone(),
-                            loc.clone(),
-                            manifest,
-                            stop_block,
-                            Box::new(SubgraphTriggerProcessor {}),
-                        )
-                        .await?;
+        let subgraph_start_future = {
+            let deployment_status_metric = deployment_status_metric.clone();
 
-                    self.start_subgraph_inner(logger, loc, runner).await
-                }
-                BlockchainKind::Near => {
-                    let runner = instance_manager
-                        .build_subgraph_runner::<graph_chain_near::Chain>(
-                            logger.clone(),
-                            self.env_vars.cheap_clone(),
-                            loc.clone(),
-                            manifest,
-                            stop_block,
-                            Box::new(SubgraphTriggerProcessor {}),
-                        )
-                        .await?;
+            async move {
+                match BlockchainKind::from_manifest(&manifest)? {
+                    BlockchainKind::Arweave => {
+                        let runner = instance_manager
+                            .build_subgraph_runner::<graph_chain_arweave::Chain>(
+                                logger.clone(),
+                                self.env_vars.cheap_clone(),
+                                loc.clone(),
+                                manifest,
+                                stop_block,
+                                Box::new(SubgraphTriggerProcessor {}),
+                                deployment_status_metric,
+                            )
+                            .await?;
 
-                    self.start_subgraph_inner(logger, loc, runner).await
-                }
-                BlockchainKind::Cosmos => {
-                    let runner = instance_manager
-                        .build_subgraph_runner::<graph_chain_cosmos::Chain>(
-                            logger.clone(),
-                            self.env_vars.cheap_clone(),
-                            loc.clone(),
-                            manifest,
-                            stop_block,
-                            Box::new(SubgraphTriggerProcessor {}),
-                        )
-                        .await?;
+                        self.start_subgraph_inner(logger, loc, runner).await
+                    }
+                    BlockchainKind::Ethereum => {
+                        let runner = instance_manager
+                            .build_subgraph_runner::<graph_chain_ethereum::Chain>(
+                                logger.clone(),
+                                self.env_vars.cheap_clone(),
+                                loc.clone(),
+                                manifest,
+                                stop_block,
+                                Box::new(SubgraphTriggerProcessor {}),
+                                deployment_status_metric,
+                            )
+                            .await?;
 
-                    self.start_subgraph_inner(logger, loc, runner).await
-                }
-                BlockchainKind::Substreams => {
-                    let runner = instance_manager
-                        .build_subgraph_runner::<graph_chain_substreams::Chain>(
-                            logger.clone(),
-                            self.env_vars.cheap_clone(),
-                            loc.cheap_clone(),
-                            manifest,
-                            stop_block,
-                            Box::new(graph_chain_substreams::TriggerProcessor::new(loc.clone())),
-                        )
-                        .await?;
+                        self.start_subgraph_inner(logger, loc, runner).await
+                    }
+                    BlockchainKind::Near => {
+                        let runner = instance_manager
+                            .build_subgraph_runner::<graph_chain_near::Chain>(
+                                logger.clone(),
+                                self.env_vars.cheap_clone(),
+                                loc.clone(),
+                                manifest,
+                                stop_block,
+                                Box::new(SubgraphTriggerProcessor {}),
+                                deployment_status_metric,
+                            )
+                            .await?;
 
-                    self.start_subgraph_inner(logger, loc, runner).await
-                }
-                BlockchainKind::Starknet => {
-                    let runner = instance_manager
-                        .build_subgraph_runner::<graph_chain_starknet::Chain>(
-                            logger.clone(),
-                            self.env_vars.cheap_clone(),
-                            loc.clone(),
-                            manifest,
-                            stop_block,
-                            Box::new(SubgraphTriggerProcessor {}),
-                        )
-                        .await?;
+                        self.start_subgraph_inner(logger, loc, runner).await
+                    }
+                    BlockchainKind::Cosmos => {
+                        let runner = instance_manager
+                            .build_subgraph_runner::<graph_chain_cosmos::Chain>(
+                                logger.clone(),
+                                self.env_vars.cheap_clone(),
+                                loc.clone(),
+                                manifest,
+                                stop_block,
+                                Box::new(SubgraphTriggerProcessor {}),
+                                deployment_status_metric,
+                            )
+                            .await?;
 
-                    self.start_subgraph_inner(logger, loc, runner).await
+                        self.start_subgraph_inner(logger, loc, runner).await
+                    }
+                    BlockchainKind::Substreams => {
+                        let runner = instance_manager
+                            .build_subgraph_runner::<graph_chain_substreams::Chain>(
+                                logger.clone(),
+                                self.env_vars.cheap_clone(),
+                                loc.cheap_clone(),
+                                manifest,
+                                stop_block,
+                                Box::new(graph_chain_substreams::TriggerProcessor::new(
+                                    loc.clone(),
+                                )),
+                                deployment_status_metric,
+                            )
+                            .await?;
+
+                        self.start_subgraph_inner(logger, loc, runner).await
+                    }
                 }
             }
         };
@@ -144,12 +167,16 @@ impl<S: SubgraphStore> SubgraphInstanceManagerTrait for SubgraphInstanceManager<
         graph::spawn(async move {
             match subgraph_start_future.await {
                 Ok(()) => {}
-                Err(err) => error!(
-                    err_logger,
-                    "Failed to start subgraph";
-                    "error" => format!("{:#}", err),
-                    "code" => LogCode::SubgraphStartFailure
-                ),
+                Err(err) => {
+                    deployment_status_metric.failed();
+
+                    error!(
+                        err_logger,
+                        "Failed to start subgraph";
+                        "error" => format!("{:#}", err),
+                        "code" => LogCode::SubgraphStartFailure
+                    );
+                }
             }
         });
     }
@@ -197,6 +224,7 @@ impl<S: SubgraphStore> SubgraphInstanceManager<S> {
             static_filters,
             env_vars,
             arweave_service,
+            subgraph_start_counter: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -208,6 +236,7 @@ impl<S: SubgraphStore> SubgraphInstanceManager<S> {
         manifest: serde_yaml::Mapping,
         stop_block: Option<BlockNumber>,
         tp: Box<dyn TriggerProcessor<C, RuntimeHostBuilder<C>>>,
+        deployment_status_metric: DeploymentStatusMetric,
     ) -> anyhow::Result<SubgraphRunner<C, RuntimeHostBuilder<C>>>
     where
         C: Blockchain,
@@ -306,7 +335,7 @@ impl<S: SubgraphStore> SubgraphInstanceManager<S> {
             .collect::<Vec<_>>();
 
         let required_capabilities = C::NodeCapabilities::from_data_sources(&onchain_data_sources);
-        let network = manifest.network_name();
+        let network: Word = manifest.network_name().into();
 
         let chain = self
             .chains
@@ -328,6 +357,18 @@ impl<S: SubgraphStore> SubgraphInstanceManager<S> {
                     .flatten()
             })
             .collect();
+
+        // We can set `max_end_block` to the maximum of `end_blocks` and stop the subgraph
+        // only when there are no dynamic data sources and no offchain data sources present. This is because:
+        // - Dynamic data sources do not have a defined `end_block`, so we can't determine
+        //   when to stop processing them.
+        // - Offchain data sources might require processing beyond the end block of
+        //   onchain data sources, so the subgraph needs to continue.
+        let max_end_block: Option<BlockNumber> = if data_sources.len() == end_blocks.len() {
+            end_blocks.iter().max().cloned()
+        } else {
+            None
+        };
 
         let templates = Arc::new(manifest.templates.clone());
 
@@ -366,6 +407,7 @@ impl<S: SubgraphStore> SubgraphInstanceManager<S> {
             registry.cheap_clone(),
             deployment.hash.as_str(),
             stopwatch_metrics.clone(),
+            deployment_status_metric,
         ));
 
         let block_stream_metrics = Arc::new(BlockStreamMetrics::new(
@@ -389,8 +431,9 @@ impl<S: SubgraphStore> SubgraphInstanceManager<S> {
         let deployment_head = store.block_ptr().map(|ptr| ptr.number).unwrap_or(0) as f64;
         block_stream_metrics.deployment_head.set(deployment_head);
 
+        let (runtime_adapter, decoder_hook) = chain.runtime()?;
         let host_builder = graph_runtime_wasm::RuntimeHostBuilder::new(
-            chain.runtime_adapter(),
+            runtime_adapter,
             self.link_resolver.cheap_clone(),
             subgraph_store.ens_lookup(),
         );
@@ -408,12 +451,15 @@ impl<S: SubgraphStore> SubgraphInstanceManager<S> {
 
         let instrument = self.subgraph_store.instrument(&deployment)?;
 
+        let decoder = Box::new(Decoder::new(decoder_hook));
+
         let inputs = IndexingInputs {
             deployment: deployment.clone(),
             features,
             start_blocks,
             end_blocks,
             stop_block,
+            max_end_block,
             store,
             debug_fork,
             triggers_adapter,
@@ -422,7 +468,7 @@ impl<S: SubgraphStore> SubgraphInstanceManager<S> {
             unified_api_version,
             static_filters: self.static_filters,
             poi_version,
-            network,
+            network: network.to_string(),
             instrument,
         };
 
@@ -438,6 +484,7 @@ impl<S: SubgraphStore> SubgraphInstanceManager<S> {
                 self.instances.cheap_clone(),
                 offchain_monitor,
                 tp,
+                decoder,
             );
             for data_source in data_sources {
                 ctx.add_dynamic_data_source(&logger, data_source)?;
@@ -470,7 +517,7 @@ impl<S: SubgraphStore> SubgraphInstanceManager<S> {
         <C as Blockchain>::MappingTrigger: ToAscPtr,
     {
         let registry = self.metrics_registry.cheap_clone();
-        let subgraph_metrics_unregister = runner.metrics.subgraph.cheap_clone();
+        let subgraph_metrics = runner.metrics.subgraph.cheap_clone();
 
         // Keep restarting the subgraph until it terminates. The subgraph
         // will usually only run once, but is restarted whenever a block
@@ -486,16 +533,31 @@ impl<S: SubgraphStore> SubgraphInstanceManager<S> {
         // it has a dedicated OS thread so the OS will handle the preemption. See
         // https://github.com/tokio-rs/tokio/issues/3493.
         graph::spawn_thread(deployment.to_string(), move || {
-            if let Err(e) = graph::block_on(task::unconstrained(runner.run())) {
-                error!(
-                    &logger,
-                    "Subgraph instance failed to run: {}",
-                    format!("{:#}", e)
-                );
+            match graph::block_on(task::unconstrained(runner.run())) {
+                Ok(()) => {
+                    subgraph_metrics.deployment_status.stopped();
+                }
+                Err(SubgraphRunnerError::Duplicate) => {
+                    // We do not need to unregister metrics because they are unique per subgraph
+                    // and another runner is still active.
+                    return;
+                }
+                Err(err) => {
+                    error!(&logger, "Subgraph instance failed to run: {:#}", err);
+                    subgraph_metrics.deployment_status.failed();
+                }
             }
-            subgraph_metrics_unregister.unregister(registry);
+
+            subgraph_metrics.unregister(registry);
         });
 
         Ok(())
+    }
+
+    pub fn new_deployment_status_metric(
+        &self,
+        deployment: &DeploymentLocator,
+    ) -> DeploymentStatusMetric {
+        DeploymentStatusMetric::register(&self.metrics_registry, deployment)
     }
 }

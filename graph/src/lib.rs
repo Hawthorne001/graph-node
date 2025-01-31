@@ -16,8 +16,6 @@ pub mod log;
 /// `CheapClone` trait.
 pub mod cheap_clone;
 
-pub mod ipfs_client;
-
 pub mod data_source;
 
 pub mod blockchain;
@@ -37,6 +35,8 @@ pub mod schema;
 /// Helpers for parsing environment variables.
 pub mod env;
 
+pub mod ipfs;
+
 /// Wrapper for spawning tasks that abort on panic, which is our default.
 mod task_spawn;
 pub use task_spawn::{
@@ -45,6 +45,14 @@ pub use task_spawn::{
 
 pub use anyhow;
 pub use bytes;
+pub use futures01;
+pub use futures03;
+pub use graph_derive as derive;
+pub use http;
+pub use http0;
+pub use http_body_util;
+pub use hyper;
+pub use hyper_util;
 pub use itertools;
 pub use parking_lot;
 pub use petgraph;
@@ -70,19 +78,10 @@ pub mod prelude {
     pub use ::anyhow;
     pub use anyhow::{anyhow, Context as _, Error};
     pub use async_trait::async_trait;
-    pub use bigdecimal;
     pub use chrono;
     pub use diesel;
     pub use envconfig;
     pub use ethabi;
-    pub use futures::future;
-    pub use futures::prelude::*;
-    pub use futures::stream;
-    pub use futures03;
-    pub use futures03::compat::{Future01CompatExt, Sink01CompatExt, Stream01CompatExt};
-    pub use futures03::future::{FutureExt as _, TryFutureExt};
-    pub use futures03::sink::SinkExt as _;
-    pub use futures03::stream::{StreamExt as _, TryStreamExt};
     pub use hex;
     pub use isatty;
     pub use lazy_static::lazy_static;
@@ -126,8 +125,6 @@ pub mod prelude {
         stopwatch::StopwatchMetrics, subgraph::*, Collector, Counter, CounterVec, Gauge, GaugeVec,
         Histogram, HistogramOpts, HistogramVec, MetricsRegistry, Opts, PrometheusError, Registry,
     };
-    pub use crate::components::server::index_node::IndexNodeServer;
-    pub use crate::components::server::query::GraphQLServer;
     pub use crate::components::server::subscription::SubscriptionServer;
     pub use crate::components::store::{
         write::EntityModification, AttributeNames, BlockNumber, CachedEthereumCall, ChainStore,
@@ -189,6 +186,7 @@ pub mod prelude {
         ($m:ident, $m2:ident, {$($n:ident,)*}) => {
             pub mod $m {
                 use graphql_parser::$m2 as $m;
+                pub use graphql_parser::Pos;
                 pub use $m::*;
                 $(
                     pub type $n = $m::$n<'static, String>;

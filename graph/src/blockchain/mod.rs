@@ -18,9 +18,10 @@ mod types;
 use crate::{
     cheap_clone::CheapClone,
     components::{
+        metrics::subgraph::SubgraphInstanceMetrics,
         store::{DeploymentCursorTracker, DeploymentLocator, StoredDynamicDataSource},
-        subgraph::HostMetrics,
-        subgraph::InstanceDSTemplateInfo,
+        subgraph::{HostMetrics, InstanceDSTemplateInfo, MappingError},
+        trigger_processor::RunnableTriggers,
     },
     data::subgraph::{UnifiedMappingApiVersion, MIN_SPEC_VERSION},
     data_source::{self, DataSourceTemplateInfo},
@@ -33,9 +34,10 @@ use crate::{
 };
 use anyhow::{anyhow, Context, Error};
 use async_trait::async_trait;
+use graph_derive::CheapClone;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
-use slog::Logger;
+use slog::{error, Logger};
 use std::{
     any::Any,
     collections::{HashMap, HashSet},
@@ -55,11 +57,13 @@ use self::{
     block_stream::{BlockStream, FirehoseCursor},
     client::ChainClient,
 };
+use crate::components::network_provider::ChainName;
 
 #[async_trait]
 pub trait BlockIngestor: 'static + Send + Sync {
     async fn run(self: Box<Self>);
-    fn network_name(&self) -> String;
+    fn network_name(&self) -> ChainName;
+    fn kind(&self) -> BlockchainKind;
 }
 
 pub trait TriggersAdapterSelector<C: Blockchain>: Sync + Send {
@@ -145,7 +149,7 @@ pub trait Blockchain: Debug + Sized + Send + Sync + Unpin + 'static {
     const KIND: BlockchainKind;
     const ALIASES: &'static [&'static str] = &[];
 
-    type Client: Debug + Default + Sync + Send;
+    type Client: Debug + Sync + Send;
     // The `Clone` bound is used when reprocessing a block, because `triggers_in_block` requires an
     // owned `Block`. It would be good to come up with a way to remove this bound.
     type Block: Block + Clone + Debug + Default;
@@ -167,6 +171,11 @@ pub trait Blockchain: Debug + Sized + Send + Sync + Unpin + 'static {
     type TriggerFilter: TriggerFilter<Self>;
 
     type NodeCapabilities: NodeCapabilities<Self> + std::fmt::Display;
+
+    /// A callback that is called after the triggers have been decoded and
+    /// gets an opportunity to post-process triggers before they are run on
+    /// hosts
+    type DecoderHook: DecoderHook<Self> + Sync + Send;
 
     fn triggers_adapter(
         &self,
@@ -200,11 +209,11 @@ pub trait Blockchain: Debug + Sized + Send + Sync + Unpin + 'static {
 
     fn is_refetch_block_required(&self) -> bool;
 
-    fn runtime_adapter(&self) -> Arc<dyn RuntimeAdapter<Self>>;
+    fn runtime(&self) -> anyhow::Result<(Arc<dyn RuntimeAdapter<Self>>, Self::DecoderHook)>;
 
     fn chain_client(&self) -> Arc<ChainClient<Self>>;
 
-    fn block_ingestor(&self) -> anyhow::Result<Box<dyn BlockIngestor>>;
+    async fn block_ingestor(&self) -> anyhow::Result<Box<dyn BlockIngestor>>;
 }
 
 #[derive(Error, Debug)]
@@ -218,6 +227,14 @@ pub enum IngestorError {
     /// disappeared in a chain reorg.
     #[error("Receipt for tx {1:?} unavailable, block was likely uncled (block hash = {0:?})")]
     ReceiptUnavailable(H256, H256),
+
+    /// The Ethereum node does not know about this block for some reason
+    #[error("Transaction receipts for block (block hash = {0:?}) is unavailable")]
+    BlockReceiptsUnavailable(H256),
+
+    /// The Ethereum node does not know about this block for some reason
+    #[error("Received confliciting block receipts for block (block hash = {0:?})")]
+    BlockReceiptsMismatched(H256),
 
     /// An unexpected error occurred.
     #[error("Ingestor error: {0:#}")]
@@ -300,11 +317,15 @@ pub trait DataSource<C: Blockchain>: 'static + Sized + Send + Sync + Clone {
     fn as_stored_dynamic_data_source(&self) -> StoredDynamicDataSource;
 
     /// Used as part of manifest validation. If there are no errors, return an empty vector.
-    fn validate(&self) -> Vec<Error>;
+    fn validate(&self, spec_version: &semver::Version) -> Vec<Error>;
 
     fn has_expired(&self, block: BlockNumber) -> bool {
         self.end_block()
             .map_or(false, |end_block| block > end_block)
+    }
+
+    fn has_declared_calls(&self) -> bool {
+        false
     }
 }
 
@@ -369,6 +390,35 @@ pub trait MappingTriggerTrait {
     fn error_context(&self) -> String;
 }
 
+/// A callback that is called after the triggers have been decoded.
+#[async_trait]
+pub trait DecoderHook<C: Blockchain> {
+    async fn after_decode<'a>(
+        &self,
+        logger: &Logger,
+        block_ptr: &BlockPtr,
+        triggers: Vec<RunnableTriggers<'a, C>>,
+        metrics: &Arc<SubgraphInstanceMetrics>,
+    ) -> Result<Vec<RunnableTriggers<'a, C>>, MappingError>;
+}
+
+/// A decoder hook that does nothing and just returns the triggers that were
+/// passed in
+pub struct NoopDecoderHook;
+
+#[async_trait]
+impl<C: Blockchain> DecoderHook<C> for NoopDecoderHook {
+    async fn after_decode<'a>(
+        &self,
+        _: &Logger,
+        _: &BlockPtr,
+        triggers: Vec<RunnableTriggers<'a, C>>,
+        _: &Arc<SubgraphInstanceMetrics>,
+    ) -> Result<Vec<RunnableTriggers<'a, C>>, MappingError> {
+        Ok(triggers)
+    }
+}
+
 pub struct HostFnCtx<'a> {
     pub logger: Logger,
     pub block_ptr: BlockPtr,
@@ -379,19 +429,10 @@ pub struct HostFnCtx<'a> {
 
 /// Host fn that receives one u32 argument and returns an u32.
 /// The name for an AS fuction is in the format `<namespace>.<function>`.
-#[derive(Clone)]
+#[derive(Clone, CheapClone)]
 pub struct HostFn {
     pub name: &'static str,
     pub func: Arc<dyn Send + Sync + Fn(HostFnCtx, u32) -> Result<u32, HostExportError>>,
-}
-
-impl CheapClone for HostFn {
-    fn cheap_clone(&self) -> Self {
-        HostFn {
-            name: self.name,
-            func: self.func.cheap_clone(),
-        }
-    }
 }
 
 pub trait RuntimeAdapter<C: Blockchain>: Send + Sync {
@@ -419,8 +460,6 @@ pub enum BlockchainKind {
     Cosmos,
 
     Substreams,
-
-    Starknet,
 }
 
 impl fmt::Display for BlockchainKind {
@@ -431,7 +470,6 @@ impl fmt::Display for BlockchainKind {
             BlockchainKind::Near => "near",
             BlockchainKind::Cosmos => "cosmos",
             BlockchainKind::Substreams => "substreams",
-            BlockchainKind::Starknet => "starknet",
         };
         write!(f, "{}", value)
     }
@@ -447,7 +485,6 @@ impl FromStr for BlockchainKind {
             "near" => Ok(BlockchainKind::Near),
             "cosmos" => Ok(BlockchainKind::Cosmos),
             "substreams" => Ok(BlockchainKind::Substreams),
-            "starknet" => Ok(BlockchainKind::Starknet),
             _ => Err(anyhow!("unknown blockchain kind {}", s)),
         }
     }
@@ -475,18 +512,42 @@ impl BlockchainKind {
 
 /// A collection of blockchains, keyed by `BlockchainKind` and network.
 #[derive(Default, Debug, Clone)]
-pub struct BlockchainMap(HashMap<(BlockchainKind, String), Arc<dyn Any + Send + Sync>>);
+pub struct BlockchainMap(HashMap<(BlockchainKind, ChainName), Arc<dyn Any + Send + Sync>>);
 
 impl BlockchainMap {
     pub fn new() -> Self {
         Self::default()
     }
 
-    pub fn insert<C: Blockchain>(&mut self, network: String, chain: Arc<C>) {
+    pub fn iter(
+        &self,
+    ) -> impl Iterator<Item = (&(BlockchainKind, ChainName), &Arc<dyn Any + Sync + Send>)> {
+        self.0.iter()
+    }
+
+    pub fn insert<C: Blockchain>(&mut self, network: ChainName, chain: Arc<C>) {
         self.0.insert((C::KIND, network), chain);
     }
 
-    pub fn get<C: Blockchain>(&self, network: String) -> Result<Arc<C>, Error> {
+    pub fn get_all_by_kind<C: Blockchain>(
+        &self,
+        kind: BlockchainKind,
+    ) -> Result<Vec<Arc<C>>, Error> {
+        self.0
+            .iter()
+            .flat_map(|((k, _), chain)| {
+                if k.eq(&kind) {
+                    Some(chain.cheap_clone().downcast().map_err(|_| {
+                        anyhow!("unable to downcast, wrong type for blockchain {}", C::KIND)
+                    }))
+                } else {
+                    None
+                }
+            })
+            .collect::<Result<Vec<Arc<C>>, Error>>()
+    }
+
+    pub fn get<C: Blockchain>(&self, network: ChainName) -> Result<Arc<C>, Error> {
         self.0
             .get(&(C::KIND, network.clone()))
             .with_context(|| format!("no network {} found on chain {}", network, C::KIND))?

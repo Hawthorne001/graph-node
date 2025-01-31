@@ -7,14 +7,13 @@ description = "Provides static store instance for tests."
 
 [dependencies]
 graph-graphql = { path = "../../graphql" }
-graphql-parser = "0.4.0"
 graph-node = { path = "../../node" }
 graph = { path = "../../graph" }
 graph-store-postgres = { path = "../postgres" }
 graph-chain-ethereum = { path = "../../chain/ethereum" }
-lazy_static = "1.1"
+lazy_static = "1.5"
 hex-literal = "0.4"
-diesel = { version = "1.4.8", features = ["postgres", "serde_json", "numeric", "r2d2"] }
+diesel = { workspace = true }
 prost-types = { workspace = true }
 
 [dev-dependencies]

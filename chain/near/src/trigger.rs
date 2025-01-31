@@ -1,7 +1,7 @@
 use graph::blockchain::Block;
 use graph::blockchain::MappingTriggerTrait;
 use graph::blockchain::TriggerData;
-use graph::cheap_clone::CheapClone;
+use graph::derive::CheapClone;
 use graph::prelude::hex;
 use graph::prelude::web3::types::H256;
 use graph::prelude::BlockNumber;
@@ -15,6 +15,7 @@ use crate::codec;
 // Logging the block is too verbose, so this strips the block from the trigger for Debug.
 impl std::fmt::Debug for NearTrigger {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        #[allow(unused)]
         #[derive(Debug)]
         pub enum MappingTriggerWithoutBlock<'a> {
             Block,
@@ -50,19 +51,10 @@ impl ToAscPtr for NearTrigger {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, CheapClone)]
 pub enum NearTrigger {
     Block(Arc<codec::Block>),
     Receipt(Arc<ReceiptWithOutcome>),
-}
-
-impl CheapClone for NearTrigger {
-    fn cheap_clone(&self) -> NearTrigger {
-        match self {
-            NearTrigger::Block(block) => NearTrigger::Block(block.cheap_clone()),
-            NearTrigger::Receipt(receipt) => NearTrigger::Receipt(receipt.cheap_clone()),
-        }
-    }
 }
 
 impl PartialEq for NearTrigger {

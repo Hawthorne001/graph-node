@@ -16,13 +16,13 @@ data points are to be aggregated. A very simple aggregation can be declared like
 ```graphql
 type Data @entity(timeseries: true) {
   id: Int8!
-  timestamp: Int8!
+  timestamp: Timestamp!
   price: BigDecimal!
 }
 
 type Stats @aggregation(intervals: ["hour", "day"], source: "Data") {
   id: Int8!
-  timestamp: Int8!
+  timestamp: Timestamp!
   sum: BigDecimal! @aggregate(fn: "sum", arg: "price")
 }
 ```
@@ -48,8 +48,6 @@ for example, to the beginning of the hour for an hourly aggregation. The
 the aggregation. Which one is chosen is not specified and should not be
 relied on.
 
-**TODO**: add a `Timestamp` type and use that for `timestamp`
-
 **TODO**: figure out whether we should just automatically add `id` and
 `timestamp` and have validation just check that these fields don't exist
 
@@ -65,7 +63,7 @@ type Token @entity { .. }
 # Raw data points
 type TokenData @entity(timeseries: true) {
     id: Bytes!
-    timestamp: Int8!
+    timestamp: Timestamp!
     token: Token!
     amount: BigDecimal!
     priceUSD: BigDecimal!
@@ -74,7 +72,7 @@ type TokenData @entity(timeseries: true) {
 # Aggregations over TokenData
 type TokenStats @aggregation(intervals: ["hour", "day"], source: "TokenData") {
   id: Int8!
-  timestamp: Int8!
+  timestamp: Timestamp!
   token: Token!
   totalVolume: BigDecimal! @aggregate(fn: "sum", arg: "amount")
   priceUSD: BigDecimal! @aggregate(fn: "last", arg: "priceUSD")
@@ -98,22 +96,14 @@ directive also accepts a boolean flag `cumulative` that indicates whether
 the aggregation should be cumulative. Cumulative aggregations aggregate over
 the entire timeseries up to the end of the time interval for the bucket.
 
-**TODO** Since average is a little more complicated to handle for cumulative
-aggregations, and it doesn't seem like it used in practice, we won't
-initially support it. (same for variance, stddev etc.)
-
-**TODO** It might be necessary to allow `@aggregate` fields that are only
-used for some intervals. We could allow that with syntax like
-`@aggregate(fn: .., arg: .., interval: "day")`
-
 ## Specification
 
 ### Timeseries
 
 A timeseries is an entity type with the annotation `@entity(timeseries:
-true)`. It must have an `id` attribute and a `timestamp` attribute of type
-`Int8`. It must not also be annotated with `immutable: false` as timeseries
-are always immutable.
+true)`. It must have an `id` attribute of type `Int8` and a `timestamp`
+attribute of type `Timestamp`. It must not also be annotated with
+`immutable: false` as timeseries are always immutable.
 
 ### Aggregations
 
@@ -125,8 +115,8 @@ must have two arguments:
 - `source`: the name of a timeseries type. Aggregates are computed based on
   the attributes of the timeseries type.
 
-The aggregation type must have an `id` attribute and a `timestamp` attribute
-of type `Int8`.
+The aggregation type must have an `id` attribute of type `Int8` and a
+`timestamp` attribute of type `Timestamp`.
 
 The aggregation type must have at least one attribute with the `@aggregate`
 annotation. These attributes must be of a numeric type (`Int`, `Int8`,
@@ -186,9 +176,6 @@ contains the mentioned fields:
 
 ## Querying
 
-_This section is not implemented yet, and will require a bit more thought
-about details_
-
 We create a toplevel query field for each aggregation. That query field
 accepts the following arguments:
 
@@ -199,11 +186,10 @@ accepts the following arguments:
   partially filled bucket in the response. Can be either `ignore` (the
   default) or `include` (still **TODO** and not implemented)
 - Optional `timestamp_{gte|gt|lt|lte|eq|in}` filters to restrict the range
-  of timestamps to return
+  of timestamps to return. The timestamp to filter by must be a string
+  containing microseconds since the epoch. The value `"1704164640000000"`
+  corresponds to `2024-01-02T03:04Z`.
 - Timeseries are always sorted by `timestamp` and `id` in descending order
-
-**TODO** It would be nicer to sort by the dimensions and `timestamp`, but we
-don't have the internal plumbing for multi-column sort in place.
 
 ```graphql
 token_stats(interval: "hour",
@@ -219,6 +205,3 @@ token_stats(interval: "hour",
   avgVolume
 }
 ```
-
-**TODO**: what about time-travel? Is it possible to include a block
-constraint?

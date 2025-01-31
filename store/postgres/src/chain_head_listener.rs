@@ -1,9 +1,7 @@
+use graph::futures03::{self, FutureExt};
 use graph::{
     blockchain::ChainHeadUpdateStream,
-    prelude::{
-        futures03::{self, FutureExt},
-        tokio, MetricsRegistry, StoreError,
-    },
+    prelude::{tokio, MetricsRegistry, StoreError},
     prometheus::{CounterVec, GaugeVec},
     util::timed_rw_lock::TimedRwLock,
 };
@@ -264,8 +262,12 @@ impl ChainHeadUpdateSender {
             "head_block_number": number
         });
 
-        let conn = self.pool.get()?;
-        self.sender
-            .notify(&conn, CHANNEL_NAME.as_str(), Some(&self.chain_name), &msg)
+        let mut conn = self.pool.get()?;
+        self.sender.notify(
+            &mut conn,
+            CHANNEL_NAME.as_str(),
+            Some(&self.chain_name),
+            &msg,
+        )
     }
 }

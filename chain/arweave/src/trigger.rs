@@ -1,7 +1,7 @@
 use graph::blockchain::Block;
 use graph::blockchain::MappingTriggerTrait;
 use graph::blockchain::TriggerData;
-use graph::cheap_clone::CheapClone;
+use graph::derive::CheapClone;
 use graph::prelude::web3::types::H256;
 use graph::prelude::BlockNumber;
 use graph::runtime::asc_new;
@@ -17,6 +17,7 @@ use crate::codec;
 // Logging the block is too verbose, so this strips the block from the trigger for Debug.
 impl std::fmt::Debug for ArweaveTrigger {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        #[allow(unused)]
         #[derive(Debug)]
         pub enum MappingTriggerWithoutBlock {
             Block,
@@ -47,19 +48,10 @@ impl ToAscPtr for ArweaveTrigger {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, CheapClone)]
 pub enum ArweaveTrigger {
     Block(Arc<codec::Block>),
     Transaction(Arc<TransactionWithBlockPtr>),
-}
-
-impl CheapClone for ArweaveTrigger {
-    fn cheap_clone(&self) -> ArweaveTrigger {
-        match self {
-            ArweaveTrigger::Block(block) => ArweaveTrigger::Block(block.cheap_clone()),
-            ArweaveTrigger::Transaction(tx) => ArweaveTrigger::Transaction(tx.cheap_clone()),
-        }
-    }
 }
 
 impl PartialEq for ArweaveTrigger {

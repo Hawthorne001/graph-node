@@ -4,7 +4,7 @@ use std::time::Instant;
 
 use anyhow::Error;
 use async_trait::async_trait;
-use futures::sync::mpsc;
+use futures01::sync::mpsc;
 
 use crate::blockchain::BlockTime;
 use crate::components::metrics::gas::GasMetrics;
@@ -47,6 +47,15 @@ impl MappingError {
             PossibleReorg(e) => PossibleReorg(e.context(s)),
             Unknown(e) => Unknown(e.context(s)),
         }
+    }
+
+    pub fn add_trigger_context<C: Blockchain>(mut self, trigger: &TriggerData<C>) -> MappingError {
+        let error_context = trigger.error_context();
+        if !error_context.is_empty() {
+            self = self.context(error_context)
+        }
+        self = self.context("failed to process trigger".to_string());
+        self
     }
 }
 
@@ -96,6 +105,9 @@ pub trait RuntimeHost<C: Blockchain>: Send + Sync + 'static {
     /// Convenience function to avoid leaking internal representation of
     /// mutable number. Calling this on OnChain Datasources is a noop.
     fn set_done_at(&self, block: Option<BlockNumber>);
+
+    /// Return a metrics object for this host.
+    fn host_metrics(&self) -> Arc<HostMetrics>;
 }
 
 pub struct HostMetrics {

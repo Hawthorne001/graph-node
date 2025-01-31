@@ -1,6 +1,12 @@
 //! Types and helpers to deal with entity IDs which support a subset of the
 //! types that more general values support
 use anyhow::{anyhow, Context, Error};
+use diesel::{
+    pg::Pg,
+    query_builder::AstPass,
+    sql_types::{BigInt, Binary, Text},
+    QueryResult,
+};
 use stable_hash::{StableHash, StableHasher};
 use std::convert::TryFrom;
 use std::fmt;
@@ -16,7 +22,8 @@ use crate::{
     components::store::StoreError,
     constraint_violation,
     data::value::Word,
-    prelude::{CacheWeight, QueryExecutionError},
+    derive::CacheWeight,
+    prelude::QueryExecutionError,
     runtime::gas::{Gas, GasSizeOf},
 };
 
@@ -131,7 +138,7 @@ impl std::fmt::Display for IdType {
 }
 
 /// Values for the ids of entities
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, CacheWeight, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Id {
     String(Word),
     Bytes(scalar::Bytes),
@@ -212,16 +219,6 @@ impl std::fmt::Display for Id {
     }
 }
 
-impl CacheWeight for Id {
-    fn indirect_weight(&self) -> usize {
-        match self {
-            Id::String(s) => s.indirect_weight(),
-            Id::Bytes(b) => b.indirect_weight(),
-            Id::Int8(_) => 0,
-        }
-    }
-}
-
 impl GasSizeOf for Id {
     fn gas_size_of(&self) -> Gas {
         match self {
@@ -297,6 +294,24 @@ impl<'a> IdRef<'a> {
             IdRef::String(_) => IdType::String,
             IdRef::Bytes(_) => IdType::Bytes,
             IdRef::Int8(_) => IdType::Int8,
+        }
+    }
+
+    pub fn push_bind_param<'b>(&'b self, out: &mut AstPass<'_, 'b, Pg>) -> QueryResult<()> {
+        match self {
+            IdRef::String(s) => out.push_bind_param::<Text, _>(*s),
+            IdRef::Bytes(b) => out.push_bind_param::<Binary, _>(*b),
+            IdRef::Int8(i) => out.push_bind_param::<BigInt, _>(i),
+        }
+    }
+}
+
+impl<'a> From<&'a Id> for IdRef<'a> {
+    fn from(id: &'a Id) -> Self {
+        match id {
+            Id::String(s) => IdRef::String(s.as_str()),
+            Id::Bytes(b) => IdRef::Bytes(b.as_slice()),
+            Id::Int8(i) => IdRef::Int8(*i),
         }
     }
 }
@@ -448,11 +463,23 @@ impl IdList {
         }
     }
 
-    pub fn index(&self, index: usize) -> IdRef<'_> {
+    pub fn index<'b>(&'b self, index: usize) -> IdRef<'b> {
         match self {
             IdList::String(ids) => IdRef::String(&ids[index]),
             IdList::Bytes(ids) => IdRef::Bytes(ids[index].as_slice()),
             IdList::Int8(ids) => IdRef::Int8(ids[index]),
+        }
+    }
+
+    pub fn bind_entry<'b>(
+        &'b self,
+        index: usize,
+        out: &mut AstPass<'_, 'b, Pg>,
+    ) -> QueryResult<()> {
+        match self {
+            IdList::String(ids) => out.push_bind_param::<Text, _>(&ids[index]),
+            IdList::Bytes(ids) => out.push_bind_param::<Binary, _>(ids[index].as_slice()),
+            IdList::Int8(ids) => out.push_bind_param::<BigInt, _>(&ids[index]),
         }
     }
 

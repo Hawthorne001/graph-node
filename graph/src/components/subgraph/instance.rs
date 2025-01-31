@@ -1,6 +1,9 @@
 use crate::{
     blockchain::{Blockchain, DataSourceTemplate as _},
-    components::store::{EntityLfuCache, ReadStore, StoredDynamicDataSource},
+    components::{
+        metrics::block_state::BlockStateMetrics,
+        store::{EntityLfuCache, ReadStore, StoredDynamicDataSource},
+    },
     data::subgraph::schema::SubgraphError,
     data_source::{DataSourceTemplate, DataSourceTemplateInfo},
     prelude::*,
@@ -76,6 +79,10 @@ pub struct BlockState {
 
     // Marks whether a handler is currently executing.
     in_handler: bool,
+
+    pub metrics: BlockStateMetrics,
+
+    pub write_capacity_remaining: usize,
 }
 
 impl BlockState {
@@ -88,6 +95,8 @@ impl BlockState {
             handler_created_data_sources: Vec::new(),
             processed_data_sources: Vec::new(),
             in_handler: false,
+            metrics: BlockStateMetrics::new(),
+            write_capacity_remaining: ENV_VARS.block_write_capacity,
         }
     }
 }
@@ -104,6 +113,8 @@ impl BlockState {
             handler_created_data_sources,
             processed_data_sources,
             in_handler,
+            metrics,
+            write_capacity_remaining,
         } = self;
 
         match in_handler {
@@ -114,6 +125,9 @@ impl BlockState {
         entity_cache.extend(other.entity_cache);
         processed_data_sources.extend(other.processed_data_sources);
         persisted_data_sources.extend(other.persisted_data_sources);
+        metrics.extend(other.metrics);
+        *write_capacity_remaining =
+            write_capacity_remaining.saturating_sub(other.write_capacity_remaining);
     }
 
     pub fn has_errors(&self) -> bool {

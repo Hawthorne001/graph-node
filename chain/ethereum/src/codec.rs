@@ -92,8 +92,8 @@ impl TryInto<web3::types::Call> for Call {
                 .map_or_else(|| U256::from(0), |v| v.into()),
             gas: U256::from(self.gas_limit),
             input: Bytes::from(self.input.clone()),
-            call_type: CallType::from_i32(self.call_type)
-                .ok_or_else(|| format_err!("invalid call type: {}", self.call_type,))?
+            call_type: CallType::try_from(self.call_type)
+                .map_err(|_| graph::anyhow::anyhow!("invalid call type: {}", self.call_type))?
                 .into(),
         })
     }
@@ -151,22 +151,17 @@ impl<'a> TryInto<web3::types::Log> for LogAt<'a> {
     }
 }
 
-impl From<TransactionTraceStatus> for web3::types::U64 {
-    fn from(val: TransactionTraceStatus) -> Self {
-        let status: Option<web3::types::U64> = val.into();
-        status.unwrap_or_else(|| web3::types::U64::from(0))
-    }
-}
+impl TryFrom<TransactionTraceStatus> for Option<web3::types::U64> {
+    type Error = Error;
 
-impl Into<Option<web3::types::U64>> for TransactionTraceStatus {
-    fn into(self) -> Option<web3::types::U64> {
-        match self {
-            Self::Unknown => {
-                panic!("Got a transaction trace with status UNKNOWN, datasource is broken")
-            }
-            Self::Succeeded => Some(web3::types::U64::from(1)),
-            Self::Failed => Some(web3::types::U64::from(0)),
-            Self::Reverted => Some(web3::types::U64::from(0)),
+    fn try_from(val: TransactionTraceStatus) -> Result<Self, Self::Error> {
+        match val {
+            TransactionTraceStatus::Unknown => Err(format_err!(
+                "Got a transaction trace with status UNKNOWN, datasource is broken"
+            )),
+            TransactionTraceStatus::Succeeded => Ok(Some(web3::types::U64::from(1))),
+            TransactionTraceStatus::Failed => Ok(Some(web3::types::U64::from(0))),
+            TransactionTraceStatus::Reverted => Ok(Some(web3::types::U64::from(0))),
         }
     }
 }
@@ -197,19 +192,7 @@ impl<'a> TryInto<web3::types::Transaction> for TransactionTraceAt<'a> {
                     .from
                     .try_decode_proto("transaction from address")?,
             ),
-            to: match self.trace.calls.len() {
-                0 => Some(self.trace.to.try_decode_proto("transaction to address")?),
-                _ => {
-                    match CallType::from_i32(self.trace.calls[0].call_type).ok_or_else(|| {
-                        format_err!("invalid call type: {}", self.trace.calls[0].call_type,)
-                    })? {
-                        CallType::Create => {
-                            None // we don't want the 'to' address on a transaction that creates the contract, to align with RPC behavior
-                        }
-                        _ => Some(self.trace.to.try_decode_proto("transaction to")?),
-                    }
-                }
-            },
+            to: get_to_address(self.trace)?,
             value: self.trace.value.as_ref().map_or(U256::zero(), |x| x.into()),
             gas_price: self.trace.gas_price.as_ref().map(|x| x.into()),
             gas: U256::from(self.trace.gas_limit),
@@ -238,10 +221,9 @@ impl TryInto<EthereumBlockWithCalls> for &Block {
     type Error = Error;
 
     fn try_into(self) -> Result<EthereumBlockWithCalls, Self::Error> {
-        let header = self
-            .header
-            .as_ref()
-            .expect("block header should always be present from gRPC Firehose");
+        let header = self.header.as_ref().ok_or_else(|| {
+            format_err!("block header should always be present from gRPC Firehose")
+        })?;
 
         let block = EthereumBlockWithCalls {
             ethereum_block: EthereumBlock {
@@ -318,13 +300,14 @@ impl TryInto<EthereumBlockWithCalls> for &Block {
                                     match t.calls.len() {
                                         0 => None,
                                         _ => {
-                                            match CallType::from_i32(t.calls[0].call_type)
-                                                .ok_or_else(|| {
-                                                    format_err!(
+                                            match CallType::try_from(t.calls[0].call_type).map_err(
+                                                |_| {
+                                                    graph::anyhow::anyhow!(
                                                         "invalid call type: {}",
                                                         t.calls[0].call_type,
                                                     )
-                                                })? {
+                                                },
+                                            )? {
                                                 CallType::Create => {
                                                     Some(t.calls[0].address.try_decode_proto(
                                                         "transaction contract address",
@@ -340,14 +323,14 @@ impl TryInto<EthereumBlockWithCalls> for &Block {
                                     .iter()
                                     .map(|l| LogAt::new(l, self, t).try_into())
                                     .collect::<Result<Vec<_>, Error>>()?,
-                                status: TransactionTraceStatus::from_i32(t.status)
-                                    .ok_or_else(|| {
-                                        format_err!(
+                                status: TransactionTraceStatus::try_from(t.status)
+                                    .map_err(|_| {
+                                        graph::anyhow::anyhow!(
                                             "invalid transaction trace status: {}",
                                             t.status
                                         )
                                     })?
-                                    .into(),
+                                    .try_into()?,
                                 root: match r.state_root.len() {
                                     0 => None, // FIXME (SF): should this instead map to [0;32]?
                                     // FIXME (SF): if len < 32, what do we do?
@@ -359,7 +342,7 @@ impl TryInto<EthereumBlockWithCalls> for &Block {
                                     .logs_bloom
                                     .try_decode_proto("transaction logs bloom")?,
                                 from: t.from.try_decode_proto("transaction from")?,
-                                to: Some(t.to.try_decode_proto("transaction to")?),
+                                to: get_to_address(t)?,
                                 transaction_type: None,
                                 effective_gas_price: None,
                             })
@@ -544,5 +527,20 @@ mod test {
             // if you're confused when reading this, format needs {{ to escape {
             format!(r#"{{"block":{{"data":null,"timestamp":"{}"}}}}"#, now)
         );
+    }
+}
+
+fn get_to_address(trace: &TransactionTrace) -> Result<Option<H160>, Error> {
+    // Try to detect contract creation transactions, which have no 'to' address
+    let is_contract_creation = trace.to.len() == 0
+        || trace.calls.get(0).map_or(false, |call| {
+            CallType::try_from(call.call_type)
+                .map_or(false, |call_type| call_type == CallType::Create)
+        });
+
+    if is_contract_creation {
+        Ok(None)
+    } else {
+        Ok(Some(trace.to.try_decode_proto("transaction to address")?))
     }
 }

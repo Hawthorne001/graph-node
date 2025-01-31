@@ -8,6 +8,7 @@ use crate::{
     constraint_violation,
     data::{store::Id, subgraph::schema::SubgraphError},
     data_source::CausalityRegion,
+    derive::CacheWeight,
     prelude::DeploymentHash,
     util::cache_weight::CacheWeight,
 };
@@ -36,7 +37,7 @@ use super::{BlockNumber, EntityKey, EntityType, StoreError, StoreEvent, StoredDy
 /// `append_row`, eliminates an update in the database which would otherwise
 /// be needed to clamp the open block range of the entity to the block
 /// contained in `end`
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, CacheWeight, Debug, PartialEq, Eq)]
 pub enum EntityModification {
     /// Insert the entity
     Insert {
@@ -66,6 +67,16 @@ pub struct EntityWrite<'a> {
     // The end of the block range for which this write is valid. The value
     // of `end` itself is not included in the range
     pub end: Option<BlockNumber>,
+}
+
+impl std::fmt::Display for EntityWrite<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        let range = match self.end {
+            Some(end) => format!("[{}, {}]", self.block, end - 1),
+            None => format!("[{}, ∞)", self.block),
+        };
+        write!(f, "{}@{}", self.id, range)
+    }
 }
 
 impl<'a> TryFrom<&'a EntityModification> for EntityWrite<'a> {
@@ -291,7 +302,7 @@ impl EntityModification {
 }
 
 /// A list of entity changes grouped by the entity type
-#[derive(Debug)]
+#[derive(Debug, CacheWeight)]
 pub struct RowGroup {
     pub entity_type: EntityType,
     /// All changes for this entity type, ordered by block; i.e., if `i < j`
@@ -527,7 +538,7 @@ impl<'a> Iterator for ClampsByBlockIterator<'a> {
 }
 
 /// A list of entity changes with one group per entity type
-#[derive(Debug)]
+#[derive(Debug, CacheWeight)]
 pub struct RowGroups {
     pub groups: Vec<RowGroup>,
 }
@@ -635,6 +646,12 @@ pub struct Batch {
     pub offchain_to_remove: DataSources,
     pub error: Option<StoreError>,
     pub is_non_fatal_errors_active: bool,
+    /// Memoize the indirect weight of the batch. We need the `CacheWeight`
+    /// of the batch a lot in the write queue to determine if a batch should
+    /// be written. Recalculating it every time, which has to happen while
+    /// the writer holds a lock, conflicts with appending to the batch and
+    /// causes batches to be finished prematurely.
+    indirect_weight: usize,
 }
 
 impl Batch {
@@ -670,7 +687,7 @@ impl Batch {
         let offchain_to_remove = DataSources::new(block_ptr.cheap_clone(), offchain_to_remove);
         let first_block = block_ptr.number;
         let block_times = vec![(block, block_time)];
-        Ok(Self {
+        let mut batch = Self {
             block_ptr,
             first_block,
             block_times,
@@ -681,7 +698,10 @@ impl Batch {
             offchain_to_remove,
             error: None,
             is_non_fatal_errors_active,
-        })
+            indirect_weight: 0,
+        };
+        batch.weigh();
+        Ok(batch)
     }
 
     fn append_inner(&mut self, mut batch: Batch) -> Result<(), StoreError> {
@@ -712,6 +732,7 @@ impl Batch {
         if let Err(e) = &res {
             self.error = Some(e.clone());
         }
+        self.weigh();
         res
     }
 
@@ -772,35 +793,15 @@ impl Batch {
     pub fn groups<'a>(&'a self) -> impl Iterator<Item = &'a RowGroup> {
         self.mods.groups.iter()
     }
+
+    fn weigh(&mut self) {
+        self.indirect_weight = self.mods.indirect_weight();
+    }
 }
 
 impl CacheWeight for Batch {
     fn indirect_weight(&self) -> usize {
-        self.mods.indirect_weight()
-    }
-}
-
-impl CacheWeight for RowGroups {
-    fn indirect_weight(&self) -> usize {
-        self.groups.indirect_weight()
-    }
-}
-
-impl CacheWeight for RowGroup {
-    fn indirect_weight(&self) -> usize {
-        self.rows.indirect_weight()
-    }
-}
-
-impl CacheWeight for EntityModification {
-    fn indirect_weight(&self) -> usize {
-        match self {
-            EntityModification::Insert { key, data, .. }
-            | EntityModification::Overwrite { key, data, .. } => {
-                key.indirect_weight() + data.indirect_weight()
-            }
-            EntityModification::Remove { key, .. } => key.indirect_weight(),
-        }
+        self.indirect_weight
     }
 }
 
@@ -858,6 +859,10 @@ pub struct WriteChunk<'a> {
 impl<'a> WriteChunk<'a> {
     pub fn is_empty(&'a self) -> bool {
         self.iter().next().is_none()
+    }
+
+    pub fn len(&self) -> usize {
+        (self.group.row_count() - self.position).min(self.chunk_size)
     }
 
     pub fn iter(&self) -> WriteChunkIter<'a> {

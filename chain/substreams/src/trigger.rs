@@ -1,5 +1,3 @@
-use std::sync::Arc;
-
 use anyhow::Error;
 use graph::{
     blockchain::{
@@ -8,8 +6,8 @@ use graph::{
     components::{
         store::{DeploymentLocator, SubgraphFork},
         subgraph::{MappingError, ProofOfIndexingEvent, SharedProofOfIndexing},
+        trigger_processor::HostedTrigger,
     },
-    data_source,
     prelude::{
         anyhow, async_trait, BlockHash, BlockNumber, BlockState, CheapClone, RuntimeHostBuilder,
     },
@@ -18,6 +16,7 @@ use graph::{
 };
 use graph_runtime_wasm::module::ToAscPtr;
 use lazy_static::__Deref;
+use std::sync::Arc;
 
 use crate::{Block, Chain, NoopDataSourceTemplate, ParsedChanges};
 
@@ -132,6 +131,7 @@ impl blockchain::TriggersAdapter<Chain> for TriggersAdapter {
         &self,
         _ptr: BlockPtr,
         _offset: BlockNumber,
+        _root: Option<BlockHash>,
     ) -> Result<Option<Block>, Error> {
         unimplemented!()
     }
@@ -141,7 +141,7 @@ impl blockchain::TriggersAdapter<Chain> for TriggersAdapter {
         _from: BlockNumber,
         _to: BlockNumber,
         _filter: &TriggerFilter,
-    ) -> Result<Vec<BlockWithTriggers<Chain>>, Error> {
+    ) -> Result<(Vec<BlockWithTriggers<Chain>>, BlockNumber), Error> {
         unimplemented!()
     }
 
@@ -197,9 +197,8 @@ where
     async fn process_trigger<'a>(
         &'a self,
         logger: &Logger,
-        _: Box<dyn Iterator<Item = &T::Host> + Send + 'a>,
+        _: Vec<HostedTrigger<'a, Chain>>,
         block: &Arc<Block>,
-        _trigger: &data_source::TriggerData<Chain>,
         mut state: BlockState,
         proof_of_indexing: &SharedProofOfIndexing,
         causality_region: &str,
@@ -226,7 +225,11 @@ where
                         logger,
                     );
 
-                    state.entity_cache.set(key, entity)?;
+                    state.entity_cache.set(
+                        key,
+                        entity,
+                        Some(&mut state.write_capacity_remaining),
+                    )?;
                 }
                 ParsedChanges::Delete(entity_key) => {
                     let entity_type = entity_key.entity_type.cheap_clone();

@@ -14,8 +14,8 @@ use strum_macros::Display;
 pub use traits::*;
 pub use write::Batch;
 
-use futures::stream::poll_fn;
-use futures::{Async, Poll, Stream};
+use futures01::stream::poll_fn;
+use futures01::{Async, Poll, Stream};
 use serde::{Deserialize, Serialize};
 use std::collections::btree_map::Entry;
 use std::collections::{BTreeMap, BTreeSet, HashSet};
@@ -33,6 +33,7 @@ use crate::data::store::scalar::Bytes;
 use crate::data::store::{Id, IdList, Value};
 use crate::data::value::Word;
 use crate::data_source::CausalityRegion;
+use crate::derive::CheapClone;
 use crate::env::ENV_VARS;
 use crate::prelude::{s, Attribute, DeploymentHash, SubscriptionFilter, ValueType};
 use crate::schema::{ast as sast, EntityKey, EntityType, InputSchema};
@@ -89,6 +90,7 @@ impl DerivedEntityQuery {
     /// Checks if a given key and entity match this query.
     pub fn matches(&self, key: &EntityKey, entity: &Entity) -> bool {
         key.entity_type == self.entity_type
+            && key.causality_region == self.causality_region
             && entity
                 .get(&self.entity_field)
                 .map(|v| &self.value == v)
@@ -776,7 +778,7 @@ where
 
             // Check if interval has passed since the last time we sent something.
             // If it has, start a new delay timer
-            let should_send = match futures::future::Future::poll(&mut delay) {
+            let should_send = match futures01::future::Future::poll(&mut delay) {
                 Ok(Async::NotReady) => false,
                 // Timer errors are harmless. Treat them as if the timer had
                 // become ready.
@@ -853,7 +855,7 @@ pub struct StoredDynamicDataSource {
 /// identifier only has meaning in the context of a specific instance of
 /// graph-node. Only store code should ever construct or consume it; all
 /// other code passes it around as an opaque token.
-#[derive(Copy, Clone, Debug, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[derive(Copy, Clone, CheapClone, Debug, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub struct DeploymentId(pub i32);
 
 impl Display for DeploymentId {
@@ -872,13 +874,11 @@ impl DeploymentId {
 /// identifier (`hash`) and its unique internal identifier (`id`) which
 /// ensures we are talking about a unique location for the deployment's data
 /// in the store
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[derive(Clone, CheapClone, Debug, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub struct DeploymentLocator {
     pub id: DeploymentId,
     pub hash: DeploymentHash,
 }
-
-impl CheapClone for DeploymentLocator {}
 
 impl slog::Value for DeploymentLocator {
     fn serialize(

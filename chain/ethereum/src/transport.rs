@@ -1,4 +1,5 @@
-use graph::endpoint::{EndpointMetrics, Provider, RequestLabels};
+use graph::components::network_provider::ProviderName;
+use graph::endpoint::{EndpointMetrics, RequestLabels};
 use jsonrpc_core::types::Call;
 use jsonrpc_core::Value;
 
@@ -15,7 +16,7 @@ pub enum Transport {
     RPC {
         client: http::Http,
         metrics: Arc<EndpointMetrics>,
-        provider: Provider,
+        provider: ProviderName,
     },
     IPC(ipc::Ipc),
     WS(ws::WebSocket),
@@ -45,7 +46,7 @@ impl Transport {
     /// blocks (one such example is Infura's HTTP endpoint).
     pub fn new_rpc(
         rpc: Url,
-        headers: ::http::HeaderMap,
+        headers: graph::http::HeaderMap,
         metrics: Arc<EndpointMetrics>,
         provider: impl AsRef<str>,
     ) -> Self {

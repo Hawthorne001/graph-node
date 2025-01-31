@@ -2,10 +2,9 @@ use anyhow::Error;
 use graph::{
     endpoint::EndpointMetrics,
     env::env_var,
-    firehose::SubgraphLimit,
+    firehose::{self, FirehoseEndpoint, SubgraphLimit},
     log::logger,
     prelude::{prost, tokio, tonic, MetricsRegistry},
-    {firehose, firehose::FirehoseEndpoint},
 };
 use graph_chain_ethereum::codec;
 use hex::ToHex;
@@ -34,6 +33,7 @@ async fn main() -> Result<(), Error> {
         "firehose",
         &host,
         token,
+        None,
         false,
         false,
         SubgraphLimit::Unlimited,
@@ -44,16 +44,19 @@ async fn main() -> Result<(), Error> {
         println!("Connecting to the stream!");
         let mut stream: Streaming<firehose::Response> = match firehose
             .clone()
-            .stream_blocks(firehose::Request {
-                start_block_num: 12369739,
-                stop_block_num: 12369739,
-                cursor: match &cursor {
-                    Some(c) => c.clone(),
-                    None => String::from(""),
+            .stream_blocks(
+                firehose::Request {
+                    start_block_num: 12369739,
+                    stop_block_num: 12369739,
+                    cursor: match &cursor {
+                        Some(c) => c.clone(),
+                        None => String::from(""),
+                    },
+                    final_blocks_only: false,
+                    ..Default::default()
                 },
-                final_blocks_only: false,
-                ..Default::default()
-            })
+                &firehose::ConnectionHeaders::new(),
+            )
             .await
         {
             Ok(s) => s,
