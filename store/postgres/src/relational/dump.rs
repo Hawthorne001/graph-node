@@ -240,7 +240,7 @@ impl Metadata {
 
     fn indexes(index_list: IndexList) -> HashMap<String, Vec<String>> {
         let mut res = HashMap::new();
-        let creat = IndexCreator::new(false, true);
+        let creat = IndexCreator::new(false, true, false);
         for (name, indexes) in index_list.indexes {
             let mut indexes2 = Vec::new();
             for index in indexes {
