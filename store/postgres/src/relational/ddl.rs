@@ -410,7 +410,7 @@ impl Table {
         match (index_def, ENV_VARS.postpone_attribute_index_creation) {
             (Some(index_def), true) => {
                 let idxs = index_def
-                    .indexes_for_table(self.name.as_str(), self)
+                    .indexes_for_table(self)
                     .filter(|idx| !idx.to_postpone());
                 for idx in idxs {
                     // For copies, the `index_def` is for the source table;
