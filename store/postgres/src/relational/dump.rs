@@ -23,7 +23,7 @@ use crate::parquet::convert::rows_to_record_batch;
 use crate::parquet::schema::{arrow_schema, clamp_arrow_schema, data_sources_arrow_schema};
 use crate::parquet::writer::{ChunkInfo, ParquetChunkWriter};
 use crate::relational::dsl;
-use crate::relational::index::IndexList;
+use crate::relational::index::{IndexCreator, IndexList};
 use crate::relational::value::OidRow;
 use crate::relational::{ColumnType, SqlName, Table as RelTable};
 use crate::vid_batcher::{VidBatcher, VidRange};
@@ -240,13 +240,14 @@ impl Metadata {
 
     fn indexes(index_list: IndexList) -> HashMap<String, Vec<String>> {
         let mut res = HashMap::new();
+        let creat = IndexCreator::new(false, true);
         for (name, indexes) in index_list.indexes {
             let mut indexes2 = Vec::new();
             for index in indexes {
                 let Ok(index) = index.with_nsp("sgd".to_string()) else {
                     continue;
                 };
-                let Ok(index) = index.to_sql(true, true) else {
+                let Ok(index) = creat.to_sql(&index) else {
                     continue;
                 };
                 indexes2.push(index);

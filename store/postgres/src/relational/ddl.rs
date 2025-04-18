@@ -14,7 +14,10 @@ use crate::relational::{
     VID_COLUMN,
 };
 
-use super::{Catalog, Column, Layout, SqlName, Table, index::IndexList};
+use super::{
+    Catalog, Column, Layout, SqlName, Table,
+    index::{IndexCreator, IndexList},
+};
 
 // In debug builds (for testing etc.) unconditionally create exclusion constraints, in release
 // builds for production, skip them
@@ -40,11 +43,13 @@ impl Layout {
         let mut tables = self.tables.values().collect::<Vec<_>>();
         tables.sort_by_key(|table| table.position);
         // Output 'create table' statements for all tables
+        let creat = self.index_creator(false, false);
         for table in tables {
             table.as_ddl(
                 &self.input_schema,
                 &self.catalog,
                 index_def.as_ref(),
+                &creat,
                 &mut out,
             )?;
         }
@@ -403,6 +408,7 @@ impl Table {
         schema: &InputSchema,
         catalog: &Catalog,
         index_def: Option<&IndexList>,
+        creat: &IndexCreator,
         out: &mut String,
     ) -> fmt::Result {
         self.create_table(out)?;
@@ -416,7 +422,7 @@ impl Table {
                     // For copies, the `index_def` is for the source table;
                     // we need to make sure it is for us
                     let idx = idx.with_nsp(self.nsp.to_string()).map_err(|_| fmt::Error)?;
-                    writeln!(out, "{};", idx.to_sql(false, false)?)?;
+                    writeln!(out, "{};", creat.to_sql(&idx)?)?;
                 }
             }
             (Some(_), false) | (None, _) => {
