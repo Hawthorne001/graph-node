@@ -416,30 +416,8 @@ impl SubgraphStore {
         };
 
         // Create the actual databases schema and metadata entries
-        let index_def = if let Some(graft) = graft_base {
-            if let Some(site) = self.sites.get(graft) {
-                let store = self
-                    .stores
-                    .get(&site.shard)
-                    .ok_or_else(|| StoreError::UnknownShard(site.shard.to_string()))?;
-
-                Some(store.load_indexes(site).await?)
-            } else {
-                None
-            }
-        } else {
-            None
-        };
-
         deployment_store
-            .create_deployment(
-                schema,
-                deployment,
-                site.clone(),
-                replace,
-                OnSync::None,
-                index_def,
-            )
+            .create_deployment(schema, deployment, site.clone(), replace, OnSync::None)
             .await?;
 
         // FIXME: This simultaneously holds a `primary_conn` and a shard connection, which can
@@ -904,7 +882,6 @@ impl Inner {
             )));
         }
         let deployment = src_store.load_deployment(src.clone()).await?;
-        let index_def = src_store.load_indexes(src.clone()).await?;
 
         // Transmogrify the deployment into a new one
         let deployment = DeploymentCreate {
@@ -934,7 +911,6 @@ impl Inner {
                 dst.clone(),
                 false,
                 on_sync,
-                Some(index_def),
             )
             .await?;
 

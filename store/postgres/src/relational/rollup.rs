@@ -53,6 +53,9 @@
 //!                    group by id, timestamp, <dimensions>)
 //!   select id, timestamp, <dimensions>, <aggregates> from combined
 //! ```
+//!
+//! see also: #rollup-query-indexing for how we make sure that the `prev`
+//! query is efficient
 use std::collections::HashSet;
 use std::fmt;
 use std::ops::Range;
@@ -448,6 +451,9 @@ impl<'a> RollupSql<'a> {
 
     /// Generate a query that selects the previous value of the aggregates
     /// for any group keys that appear in `bucket`
+    ///
+    /// see also: #rollup-query-indexing Changes to this query might need to
+    /// reconsider the index that we build to make this query efficient
     fn select_prev(&self, w: &mut dyn fmt::Write) -> fmt::Result {
         write!(w, "select bucket.id, bucket.timestamp")?;
         comma_sep(self.dimensions, w, true, |w, col| {

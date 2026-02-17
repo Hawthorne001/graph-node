@@ -1,5 +1,6 @@
 //! Parse Postgres index definition into a form that is meaningful for us.
 use anyhow::{Error, anyhow};
+use graph::env::ENV_VARS;
 use std::collections::HashMap;
 use std::fmt::{Display, Write};
 
@@ -639,6 +640,10 @@ impl CreateIndex {
     }
 
     pub fn to_postpone(&self) -> bool {
+        if !ENV_VARS.postpone_attribute_index_creation {
+            return false;
+        }
+
         fn has_prefix(s: &str, prefix: &str) -> bool {
             s.starts_with(prefix)
                 || s.ends_with("\"") && s.starts_with(format!("\"{}", prefix).as_str())
@@ -666,6 +671,19 @@ impl CreateIndex {
         match self {
             CreateIndex::Unknown { .. } => None,
             CreateIndex::Parsed { name, .. } => Some(name.clone()),
+        }
+    }
+
+    /// Return `true` if any of the attribute columns (user-defined columns,
+    /// not infrastructure columns like `vid`, `block$`, etc.) referenced by
+    /// this index are NOT in `columns`.
+    pub fn references_column_not_in(&self, columns: &std::collections::HashSet<&str>) -> bool {
+        match self {
+            CreateIndex::Unknown { .. } => false,
+            CreateIndex::Parsed { columns: exprs, .. } => exprs.iter().any(|expr| match expr {
+                Expr::Column(name) | Expr::Prefix(name, _) => !columns.contains(name.as_str()),
+                _ => false,
+            }),
         }
     }
 
@@ -1318,10 +1336,11 @@ mod tests {
         parse_many(sqls, exp);
 
         let sqls = &[
-        "CREATE INDEX manual_token_random_cond ON sgd44.token USING btree (\"decimals\") WHERE decimals > (5)::numeric",
-        "CREATE INDEX manual_token_random_cond ON sgd44.token USING btree (decimals) WHERE decimals > (5)::numeric",
-        "CREATE INDEX manual_token_random_cond ON sgd44.token USING btree (decimals) WHERE ( decimals > (5)::numeric )",
-        "CREATE INDEX manual_token_random_cond ON sgd44.token USING btree (\"decimals\") WHERE ( decimals > (5)::numeric )"];
+            "CREATE INDEX manual_token_random_cond ON sgd44.token USING btree (\"decimals\") WHERE decimals > (5)::numeric",
+            "CREATE INDEX manual_token_random_cond ON sgd44.token USING btree (decimals) WHERE decimals > (5)::numeric",
+            "CREATE INDEX manual_token_random_cond ON sgd44.token USING btree (decimals) WHERE ( decimals > (5)::numeric )",
+            "CREATE INDEX manual_token_random_cond ON sgd44.token USING btree (\"decimals\") WHERE ( decimals > (5)::numeric )",
+        ];
         let exp = Parsed {
             unique: false,
             name: "manual_token_random_cond",
@@ -1334,8 +1353,9 @@ mod tests {
         parse_many(sqls, exp);
 
         let sqls = &[
-        "CREATE INDEX manual_pool_swap_enabled_total_liquidity ON sgd12.pool USING btree (\"total_liquidity\") WHERE swap_enabled",
-        "CREATE INDEX manual_pool_swap_enabled_total_liquidity ON sgd12.pool USING btree (total_liquidity) WHERE swap_enabled"];
+            "CREATE INDEX manual_pool_swap_enabled_total_liquidity ON sgd12.pool USING btree (\"total_liquidity\") WHERE swap_enabled",
+            "CREATE INDEX manual_pool_swap_enabled_total_liquidity ON sgd12.pool USING btree (total_liquidity) WHERE swap_enabled",
+        ];
         let exp = Parsed {
             unique: false,
             name: "manual_pool_swap_enabled_total_liquidity",
