@@ -502,6 +502,12 @@ impl SyncStore {
         .await
     }
 
+    async fn create_postponed_indexes(&self) -> Result<(), StoreError> {
+        self.writable
+            .create_postponed_indexes(self.site.cheap_clone())
+            .await
+    }
+
     fn input_schema(&self) -> InputSchema {
         self.input_schema.cheap_clone()
     }
@@ -1607,6 +1613,7 @@ pub struct WritableStore {
 
     // Cached to avoid querying the database.
     is_deployment_synced: AtomicBool,
+    postponed_indexes_created: AtomicBool,
 }
 
 impl WritableStore {
@@ -1648,6 +1655,7 @@ impl WritableStore {
             block_cursor,
             writer,
             is_deployment_synced: AtomicBool::new(is_deployment_synced),
+            postponed_indexes_created: AtomicBool::new(false),
         })
     }
 
@@ -1890,6 +1898,13 @@ impl WritableStoreTrait for WritableStore {
 
     async fn health(&self) -> Result<schema::SubgraphHealth, StoreError> {
         self.store.health().await
+    }
+
+    async fn create_postponed_indexes(&self) -> Result<(), StoreError> {
+        if !self.postponed_indexes_created.swap(true, Ordering::SeqCst) {
+            self.store.create_postponed_indexes().await?;
+        }
+        Ok(())
     }
 
     async fn flush(&self) -> Result<(), StoreError> {
