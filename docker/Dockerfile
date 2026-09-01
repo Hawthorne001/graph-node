@@ -42,7 +42,7 @@ RUN echo "REPO_NAME='$REPO_NAME'" > /etc/image-info \
     && echo "CARGO_DEV_BUILD='$CARGO_DEV_BUILD'" >> /etc/image-info
 
 # The graph-node runtime image with only the executable
-FROM debian:bookworm-20241111-slim AS graph-node
+FROM debian:12.13-slim AS graph-node
 ENV RUST_LOG=""
 ENV GRAPH_LOG=""
 ENV EARLY_LOG_CHUNK_SIZE=""
